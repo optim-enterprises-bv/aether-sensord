@@ -434,6 +434,23 @@ bool dpi_process(struct dpi_ctx *c, const uint8_t *pkt, uint32_t len,
 	    pr.proto.master_protocol == NDPI_PROTOCOL_UNKNOWN)
 		return false; /* undecided; keep feeding it */
 
+	/*
+	 * A protocol verdict is NOT the end of dissection.
+	 *
+	 * nDPI recognises TLS from the first handshake byte, well before it has
+	 * parsed the SNI out of the ClientHello. Stopping here -- which this
+	 * did -- yields proto=TLS with no hostname, and a protocol is not an
+	 * application, so nothing can ever be enforced. Observed on the BPI-R4:
+	 * every live flow classified, every one with host=-.
+	 *
+	 * extra_packets_func is nDPI's signal that it wants more packets for
+	 * exactly this reason. Keep feeding it until it stops asking, we have a
+	 * name, or the per-flow budget runs out.
+	 */
+	if (!f->nf->host_server_name[0] && f->nf->extra_packets_func &&
+	    f->pkts < DPI_MAX_PKTS_PER_FLOW)
+		return false; /* undecided on the NAME; keep dissecting */
+
 	f->done = true;
 	if (f->reported)
 		return false;
