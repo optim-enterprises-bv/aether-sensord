@@ -501,6 +501,7 @@ struct classify_ctx {
 	uint64_t skipped[8]; /* indexed by enum appblock_reason */
 	uint64_t apply_failed;
 	uint64_t overflows;
+	unsigned unattributed_logged;
 };
 
 static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
@@ -548,6 +549,35 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 				subject = mac;
 			else if (neigh_lookup(cc->neigh, &f.dst, mac))
 				subject = mac;
+		}
+
+		/*
+		 * Name the addresses that failed to attribute.
+		 *
+		 * "0 resolved" on its own does not say WHICH address was not
+		 * found, and without that the difference between "the table is
+		 * empty", "we looked up the wrong endpoint" and "this device
+		 * genuinely has no neighbour entry" is unguessable. Rate
+		 * limited to the first few so a busy link cannot flood syslog.
+		 */
+		if (!subject && cc->unattributed_logged < 5) {
+			char sb[64] = "?", db[64] = "?";
+			struct neigh_stats ns;
+
+			memset(&ns, 0, sizeof(ns));
+			if (cc->neigh)
+				neigh_get_stats(cc->neigh, &ns);
+			obs_addr_str(&f.src, sb, sizeof(sb));
+			obs_addr_str(&f.dst, db, sizeof(db));
+			cc->unattributed_logged++;
+			syslog(LOG_WARNING,
+			       "attribution MISS: src=%s (private=%d) dst=%s "
+			       "(private=%d) host=%s -- neighbour table holds "
+			       "%llu entries",
+			       sb, obs_addr_is_private(&f.src) ? 1 : 0,
+			       db, obs_addr_is_private(&f.dst) ? 1 : 0,
+			       f.have_host ? f.host : "-",
+			       (unsigned long long)ns.hits + ns.miss_not_found);
 		}
 		d = appblock_decide(&f, cc->sigs, cc->pol, subject, pt, 0,
 		                    cc->addr_timeout);
@@ -990,6 +1020,17 @@ int main(int argc, char **argv)
 			cls.app_target = &app_target;
 			cls.addr_timeout = cfg.dpi_addr_timeout;
 			cls.neigh = neigh_new(1024);
+			{
+				long ne = cls.neigh ? neigh_refresh(cls.neigh) : -1;
+
+				/* An empty table is not the same as a failed
+				 * read, and both look like "nothing resolved"
+				 * from the counters alone. */
+				if (ne >= 0)
+					syslog(LOG_INFO,
+					       "attribution: neighbour table "
+					       "loaded with %ld entries", ne);
+			}
 			if (cls.neigh && neigh_refresh(cls.neigh) < 0)
 				syslog(LOG_WARNING,
 				       "classification: could not read the "
