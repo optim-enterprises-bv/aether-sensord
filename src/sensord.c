@@ -502,6 +502,9 @@ struct classify_ctx {
 	uint64_t apply_failed;
 	uint64_t overflows;
 	unsigned unattributed_logged;
+	time_t last_refresh;
+	uint64_t refresh_on_miss;
+	uint64_t rescued;
 };
 
 static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
@@ -549,6 +552,42 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 				subject = mac;
 			else if (neigh_lookup(cc->neigh, &f.dst, mac))
 				subject = mac;
+
+			/*
+			 * Refresh on miss, not only on the interval.
+			 *
+			 * The table is reloaded every `interval` seconds, so a
+			 * device that appears between refreshes is
+			 * unattributable until the next one -- and its traffic
+			 * goes unenforced for that whole window with nothing
+			 * said. That is most of the damage right after a
+			 * restart, when the LAN has not been learned yet: on
+			 * the BPI-R4 the daemon reported "0 resolved, 137 no
+			 * entry" purely because every flow measured arrived
+			 * before the first refresh.
+			 *
+			 * Rate limited to once a second so a burst of
+			 * unattributable flows cannot turn into a re-read of
+			 * /proc/net/arp per packet.
+			 */
+			if (!subject) {
+				time_t now = time(NULL);
+
+				if (now != cc->last_refresh) {
+					cc->last_refresh = now;
+					cc->refresh_on_miss++;
+					if (neigh_refresh(cc->neigh) > 0) {
+						if (neigh_lookup(cc->neigh,
+						                 &f.src, mac))
+							subject = mac;
+						else if (neigh_lookup(cc->neigh,
+						                      &f.dst, mac))
+							subject = mac;
+						if (subject)
+							cc->rescued++;
+					}
+				}
+			}
 		}
 
 		/*
@@ -572,8 +611,7 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 			cc->unattributed_logged++;
 			syslog(LOG_WARNING,
 			       "attribution MISS: src=%s (private=%d) dst=%s "
-			       "(private=%d) host=%s -- neighbour table holds "
-			       "%llu entries",
+			       "(private=%d) host=%s -- %llu lookups so far",
 			       sb, obs_addr_is_private(&f.src) ? 1 : 0,
 			       db, obs_addr_is_private(&f.dst) ? 1 : 0,
 			       f.have_host ? f.host : "-",
