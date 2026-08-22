@@ -50,16 +50,23 @@ dpi_replay: dpi_replay.c ../src/dpi.c ../src/observe.c ../src/dpi.h
 	$(CC) $(CFLAGS) $(NDPI_CFLAGS) -o $@ dpi_replay.c ../src/dpi.c \
 		../src/observe.c $(NDPI_LDFLAGS)
 
+test_appblock: test_appblock.c ../src/appblock.c ../src/dpi.c ../src/observe.c \
+		../src/sigdb.c ../src/match.c ../src/policy.c ../src/afpush.c
+	$(CC) $(CFLAGS) $(NDPI_CFLAGS) -o $@ test_appblock.c ../src/appblock.c \
+		../src/dpi.c ../src/observe.c ../src/sigdb.c ../src/match.c \
+		../src/policy.c ../src/afpush.c $(NDPI_LDFLAGS)
+
 check: $(BINS)
 ifeq ($(HAVE_NDPI),yes)
-	@$(MAKE) --no-print-directory test_dpi
+	@$(MAKE) --no-print-directory test_dpi test_appblock
 	@echo "-- test_dpi"; ./test_dpi || exit 1
+	@echo "-- test_appblock"; ./test_appblock || exit 1
 else
 	@echo "-- test_dpi SKIPPED: libndpi not found."
 	@echo "   Set NDPI_PREFIX=/path/to/ndpi or install libndpi-dev."
-	@echo "   The scope decision (QUIC must never be name-hashed) is NOT"
-	@echo "   covered by this run."
+	@echo "   The scope decision (QUIC must never be name-hashed) and the"
+	@echo "   enforcement split are NOT covered by this run."
 endif
 	@for b in $(BINS); do echo "-- $$b"; ./$$b || exit 1; done
 clean:
-	rm -f $(BINS) test_dpi dpi_replay
+	rm -f $(BINS) test_dpi test_appblock dpi_replay

@@ -139,8 +139,25 @@ struct match_result match_flow(const struct sig_db *db, const char *host,
 	for (size_t i = 0; i < db->n_rules; i++) {
 		const struct sig_rule *r = &db->rules[i];
 
-		if (r->proto != SIG_PROTO_ANY && proto != SIG_PROTO_ANY &&
-		    r->proto != proto)
+		/*
+		 * The transport gate applies to PORT-based rules only.
+		 *
+		 * A hostname identifies an application however it was reached:
+		 * youtube.example is YouTube over TCP/443 and over QUIC on
+		 * UDP/443 alike. The proto field in an OAF-format signature
+		 * exists to qualify port matches ("UDP/53 is DNS"), not to
+		 * declare which transports an application may use.
+		 *
+		 * Gating host matches on it was silently fatal for QUIC. Every
+		 * one of the 1,347 shipped signatures declares tcp and not one
+		 * declares udp, so a QUIC flow could never match a signature no
+		 * matter what hostname nDPI recovered from its encrypted
+		 * Initial. Classification succeeded, the lookup returned
+		 * MATCH_NONE, and the application was simply not blocked --
+		 * with every counter reporting success.
+		 */
+		if (r->host[0] == '\0' && r->proto != SIG_PROTO_ANY &&
+		    proto != SIG_PROTO_ANY && r->proto != proto)
 			continue;
 		if (r->dport != 0 && dport != 0 && r->dport != dport)
 			continue;
