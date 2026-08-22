@@ -157,6 +157,24 @@ bool nfr_open(struct nfr_conn *c, uint16_t group, uint16_t copy_range)
 	if (c->fd < 0)
 		return false;
 
+	/*
+	 * Ask for a large receive buffer BEFORE binding.
+	 *
+	 * Classification copies whole packets, so the default netlink buffer
+	 * overflows within seconds of real forwarded traffic and the socket
+	 * starts reporting errors. Losing packets is acceptable -- dissection
+	 * only needs the first few of a flow -- but the overflow must not look
+	 * like a broken socket.
+	 */
+	{
+		int rcv = 8 * 1024 * 1024;
+
+		if (setsockopt(c->fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcv,
+		               sizeof(rcv)) != 0)
+			(void)setsockopt(c->fd, SOL_SOCKET, SO_RCVBUF, &rcv,
+			                 sizeof(rcv));
+	}
+
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
 	if (bind(c->fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {

@@ -73,7 +73,7 @@
 #define DEFAULT_DB "/etc/appfilter/feature_en.cfg"
 #define DEFAULT_SPOOL "/var/spool/aether-sensord/feed"
 #define DEFAULT_NFT_INCLUDE \
-	"/usr/share/nftables.d/table-prepend/inet/fw4/10-aether-sensord.nft"
+	"/usr/share/nftables.d/table-pre/10-aether-sensord.nft"
 #define DEFAULT_INTERVAL 30
 #define DEFAULT_TIMEOUT_SEC 604800 /* 7 days, matching the scorer's half-life */
 
@@ -500,6 +500,7 @@ struct classify_ctx {
 	uint64_t enforced_hash;
 	uint64_t skipped[8]; /* indexed by enum appblock_reason */
 	uint64_t apply_failed;
+	uint64_t overflows;
 };
 
 static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
@@ -1173,12 +1174,29 @@ int main(int argc, char **argv)
 						       "error, flows may have "
 						       "been missed");
 				}
-				if (i_dpi >= 0 &&
-				    (pfd[i_dpi].revents & (POLLERR | POLLHUP))) {
-					/* One source failing must not take the
-					 * other down with it. */
+				if (i_dpi >= 0 && (pfd[i_dpi].revents & POLLERR)) {
+					/*
+					 * On a netlink socket this is almost
+					 * always ENOBUFS: the kernel dropped
+					 * datagrams because our receive buffer
+					 * filled. That costs us packets, not the
+					 * socket, and dissection only needs the
+					 * first few packets of a flow -- so
+					 * tearing down here would turn a
+					 * recoverable burst into permanently
+					 * dead classification.
+					 */
+					cls.overflows++;
+					if (cls.overflows == 1)
+						syslog(LOG_WARNING,
+						       "classification: NFLOG "
+						       "receive buffer overflowed; "
+						       "some flows will be missed. "
+						       "Classification continues.");
+				}
+				if (i_dpi >= 0 && (pfd[i_dpi].revents & POLLHUP)) {
 					syslog(LOG_ERR, "classification: NFLOG "
-					                "socket error; "
+					                "socket closed; "
 					                "classification stops, "
 					                "everything else continues");
 					nfr_close(&dnfr);
