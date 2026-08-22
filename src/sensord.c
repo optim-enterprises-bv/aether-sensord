@@ -73,7 +73,7 @@
 #define DEFAULT_DB "/etc/appfilter/feature_en.cfg"
 #define DEFAULT_SPOOL "/var/spool/aether-sensord/feed"
 #define DEFAULT_NFT_INCLUDE \
-	"/usr/share/nftables.d/table-pre/inet/fw4/10-aether-sensord.nft"
+	"/usr/share/nftables.d/table-prepend/inet/fw4/10-aether-sensord.nft"
 #define DEFAULT_INTERVAL 30
 #define DEFAULT_TIMEOUT_SEC 604800 /* 7 days, matching the scorer's half-life */
 
@@ -148,12 +148,38 @@ struct config {
  * and it is an explicit ADR-020 gate item.
  */
 static bool install_set_decl(const struct config *cfg,
-                             const struct nft_target *t)
+                             const struct nft_target *t,
+                             const struct nft_target *app,
+                             uint32_t app_timeout)
 {
-	char decl[4096];
+	char decl[8192];
+	size_t n;
+
 	if (nft_render_set_decl(t, cfg->set_timeout, decl, sizeof(decl)) == 0) {
 		syslog(LOG_ERR, "set declaration did not fit its buffer");
 		return false;
+	}
+
+	/*
+	 * The app-block sets go in the SAME include, because they have the same
+	 * problem: a set created with `nft add set` is destroyed the next time
+	 * fw4 rebuilds its ruleset, and every address-scope app block writes
+	 * into one.
+	 *
+	 * Omitting these is what made app blocking fail on the device with "no
+	 * such set" while the daemon reported the push succeeded. Two nft
+	 * `table inet fw4 { }` blocks in one file are merged by nft, so this
+	 * appends rather than needing a second include.
+	 */
+	if (app) {
+		n = strlen(decl);
+		if (nft_render_set_decl(app, app_timeout, decl + n,
+		                        sizeof(decl) - n) == 0) {
+			syslog(LOG_ERR,
+			       "app-block set declaration did not fit; address "
+			       "scope blocks would fail with 'no such set'");
+			return false;
+		}
 	}
 
 	char tmp[512];
@@ -849,11 +875,19 @@ int main(int argc, char **argv)
 
 	struct nft_target target = { "inet", "fw4", "aether_rep4", "aether_rep6" };
 
-	if (!install_set_decl(&cfg, &target)) {
-		syslog(LOG_ERR, "cannot install nftables set declaration; refusing to "
-		                "start rather than run with nowhere to enforce");
-		sig_db_free(&sigs);
-		return 1;
+	{
+		struct nft_target app_decl = { "inet", "fw4", "aether_app4",
+		                               "aether_app6" };
+
+		if (!install_set_decl(&cfg, &target, &app_decl,
+		                      cfg.dpi_addr_timeout)) {
+			syslog(LOG_ERR,
+			       "cannot install nftables set declaration; "
+			       "refusing to start rather than run with nowhere "
+			       "to enforce");
+			sig_db_free(&sigs);
+			return 1;
+		}
 	}
 	syslog(LOG_INFO, "set declaration installed at %s (run `fw4 reload` if the "
 	                 "sets are not present yet)", cfg.nft_include);

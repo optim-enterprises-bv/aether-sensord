@@ -108,7 +108,7 @@ struct nft_target {
  * These belong in an fw4 include file, not in an imperative command: fw4 owns
  * its ruleset and rebuilds it on every reload, so a set created with `nft add
  * set` disappears the next time anything touches the firewall. Writing the
- * declaration to /usr/share/nftables.d/table-pre/inet/fw4/ makes it survive,
+ * declaration to /usr/share/nftables.d/table-prepend/inet/fw4/ makes it survive,
  * which is an explicit ADR-020 gate item.
  */
 size_t nft_render_set_decl(const struct nft_target *t, uint32_t default_timeout_sec,
