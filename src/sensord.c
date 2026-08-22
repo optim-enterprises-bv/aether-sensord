@@ -505,6 +505,7 @@ struct classify_ctx {
 	time_t last_refresh;
 	uint64_t refresh_on_miss;
 	uint64_t rescued;
+	unsigned classify_logged;
 };
 
 static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
@@ -528,6 +529,29 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 	if (!dpi_process(cc->dpi, pkt, len, now_ms, &f))
 		return;
 	cc->classified++;
+
+	/*
+	 * Log what the dissector actually produced.
+	 *
+	 * On the BPI-R4 only 10 of 48 classified flows yielded a hostname, and
+	 * enforcement needs a name -- a protocol is not an application. Without
+	 * seeing the protocol and scope per flow there is no way to tell
+	 * "nDPI could not decrypt the QUIC Initial" from "the mirror delivered
+	 * the flow after its first packets" from "this really is unnamed
+	 * traffic". Rate limited; diagnostic, not routine.
+	 */
+	if (cc->classify_logged < 25) {
+		char db[64] = "?";
+
+		cc->classify_logged++;
+		obs_addr_str(&f.dst, db, sizeof(db));
+		syslog(LOG_INFO,
+		       "dpi flow: proto=%s l4=%s dport=%u dst=%s host=%s scope=%s",
+		       f.proto_name[0] ? f.proto_name : "?",
+		       f.l4proto == 6 ? "tcp" : (f.l4proto == 17 ? "udp" : "other"),
+		       f.dport, db, f.have_host ? f.host : "-",
+		       f.scope == DPI_SCOPE_ADDRESS ? "ADDRESS" : "name-hash");
+	}
 
 	/* Policy windows are local wall-clock, not monotonic. */
 	t = time(NULL);
