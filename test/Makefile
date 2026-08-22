@@ -1,7 +1,7 @@
 # Host-side unit tests. No OpenWrt toolchain, no device, no nDPI.
 CFLAGS ?= -std=gnu11 -Wall -Wextra -Werror -O1 -g -D_GNU_SOURCE
 BINS = test_sigdb test_policy test_nft test_feed test_apply test_afpush \
-       test_observe test_nflog_raw test_polcfg test_neigh
+       test_observe test_nflog_raw test_polcfg test_neigh test_offload
 .PHONY: all check clean
 all: check
 test_sigdb: test_sigdb.c ../src/sigdb.c ../src/match.c ../src/sigdb.h ../src/match.h
@@ -25,6 +25,9 @@ test_observe: test_observe.c ../src/observe.c ../src/observe.h
 
 test_nflog_raw: test_nflog_raw.c ../src/nflog_raw.c ../src/nflog_raw.h
 	$(CC) $(CFLAGS) -o $@ test_nflog_raw.c ../src/nflog_raw.c
+
+test_offload: test_offload.c ../src/offload.c ../src/apply.c ../src/nft.c
+	$(CC) $(CFLAGS) -o $@ test_offload.c ../src/offload.c ../src/apply.c ../src/nft.c
 
 test_neigh: test_neigh.c ../src/neigh.c ../src/observe.c ../src/neigh.h
 	$(CC) $(CFLAGS) -o $@ test_neigh.c ../src/neigh.c ../src/observe.c

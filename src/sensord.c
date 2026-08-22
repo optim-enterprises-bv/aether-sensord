@@ -45,6 +45,7 @@
 #include "appblock.h"
 #include "dpi.h"
 #include "neigh.h"
+#include "offload.h"
 #include "nflog_raw.h"
 #include "observe.h"
 #include "apply.h"
@@ -920,6 +921,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+	enum offload_state offload_seen = OFFLOAD_UNKNOWN;
 	struct classify_ctx cls;
 	struct nfr_conn dnfr;
 	int dpi_live = 0;
@@ -969,6 +971,50 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/*
+	 * The flow-offload conflict.
+	 *
+	 * Checked whenever inspection is supposed to be working -- either the
+	 * kernel module is being fed rules, or classification is live. A
+	 * flowtable means established flows bypass netfilter entirely, so
+	 * neither aether-af nor the classification mirror will see the
+	 * ClientHello they depend on, and both would report healthy anyway.
+	 */
+	if (cfg.push_af || dpi_live) {
+		enum offload_state off = offload_probe(&ap);
+
+		/* Seed the change-detector, so the interval check reports
+		 * transitions rather than repeating what was just said. */
+		offload_seen = off;
+
+		switch (off) {
+		case OFFLOAD_PRESENT:
+			syslog(LOG_WARNING,
+			       "OFFLOAD CONFLICT: an nftables flowtable is "
+			       "active. Established flows bypass netfilter, so "
+			       "the TLS ClientHello is never seen and "
+			       "application inspection WILL NOT WORK -- while "
+			       "reporting healthy. Set option offload_policy "
+			       "'disable' in /etc/config/aether-sensord to turn "
+			       "flow offloading off (costs throughput), or "
+			       "accept that app filtering is inert on this "
+			       "device.");
+			break;
+		case OFFLOAD_UNKNOWN:
+			syslog(LOG_WARNING,
+			       "could not determine whether flow offloading is "
+			       "active; if it is, application inspection sees "
+			       "nothing. This is not the same as 'no conflict'.");
+			break;
+		case OFFLOAD_ABSENT:
+		default:
+			syslog(LOG_INFO,
+			       "flow offloading: no flowtable, inspection will "
+			       "see forwarded traffic");
+			break;
+		}
+	}
+
 	syslog(LOG_INFO,
 	       "started: spool=%s interval=%us set_timeout=%us sensing=%s "
 	       "classification=%s. Reputation enforcement is live.",
@@ -982,6 +1028,29 @@ int main(int argc, char **argv)
 		/* Emit before waiting, so `-1` produces a batch too. */
 		if (sense_live)
 			sense_flush(&cfg, &sense);
+
+		/*
+		 * Re-check offload every interval, not only at start. Someone
+		 * enabling flow offloading later would otherwise silently
+		 * switch inspection off, and nothing would say so.
+		 */
+		if (cfg.push_af || dpi_live) {
+			enum offload_state off = offload_probe(&ap);
+
+			if (off != offload_seen) {
+				if (off == OFFLOAD_PRESENT)
+					syslog(LOG_WARNING,
+					       "OFFLOAD CONFLICT appeared: a "
+					       "flowtable is now active; "
+					       "application inspection has "
+					       "stopped seeing traffic");
+				else if (offload_seen == OFFLOAD_PRESENT)
+					syslog(LOG_INFO,
+					       "flow offloading removed; "
+					       "inspection sees traffic again");
+				offload_seen = off;
+			}
+		}
 
 		if (feed_client_needs_resync(&fc))
 			syslog(LOG_WARNING,
