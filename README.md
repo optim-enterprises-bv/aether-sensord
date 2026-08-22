@@ -70,10 +70,29 @@ silently passing.
 
 ## Licence
 
-BSD-3-Clause, the same licence as OpenSync and for the same reason: the
-device-side agent is open so anyone can build and integrate it, while the
-controller it reports to is a separate, proprietary product.
+**Business Source License 1.1** — source-available, not open source.
 
-BSD-3-Clause. No GPL library is linked: the NFLOG receive path and the netlink
-push are written directly against sockets rather than `libnetfilter_log` or
-`libmnl`, so the declared licence is true rather than merely intended.
+You may read, modify, redistribute and make non-production use of this freely.
+**Production use is granted for use with the Aether platform**; production use
+with any other controller or cloud service requires a commercial licence.
+Converts to **GPL-2.0-or-later on 2030-08-22**.
+
+The gate is not "are you a commercial entity" — it is which controller you
+point at. An ISP running Aether is covered; the same ISP pointing this at a
+different platform is not.
+
+For commercial licensing: `licensing@optimcloud.com`.
+
+### Why not BSD, given OpenSync is
+
+The device agent is open in the sense that matters — you can read it, build it,
+and put it on your own hardware. But unlike OpenSync, which is inert without a
+controller, this daemon's application-filtering half runs standalone on a local
+UCI policy and a local signature database. That standalone value is what the
+licence protects.
+
+No GPL library is linked: the NFLOG receive path and the netlink push are
+written directly against sockets rather than `libnetfilter_log` or `libmnl`, so
+the declared licence is true rather than merely intended. The kernel module it
+drives, `aether-af`, is separately GPL-2.0 and holds only hashes — the netlink
+boundary between them is what keeps these two licences independent.
