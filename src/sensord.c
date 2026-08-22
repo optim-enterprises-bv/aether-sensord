@@ -42,6 +42,9 @@
  */
 
 #include "afpush.h"
+#include "appblock.h"
+#include "dpi.h"
+#include "neigh.h"
 #include "nflog_raw.h"
 #include "observe.h"
 #include "apply.h"
@@ -117,6 +120,22 @@ struct config {
 	const char *policy_path;
 	const char *sense_spool;
 	unsigned sense_max_batches;
+
+	/*
+	 * Application classification via nDPI.
+	 *
+	 * OFF BY DEFAULT AND CONSENTED SEPARATELY, for a stronger reason than
+	 * the sensing half. Sensing asks NFLOG for 128 bytes -- headers only,
+	 * deliberately, so packet CONTENTS never enter this process.
+	 * Classification cannot work that way: a TLS ClientHello or a QUIC
+	 * Initial is payload, and dissecting it means copying it into
+	 * userspace. That is a materially different promise to the subscriber
+	 * and it gets its own switch rather than riding on another one.
+	 */
+	int dpi_enabled;
+	unsigned dpi_group;
+	size_t dpi_max_flows;
+	uint32_t dpi_addr_timeout;
 };
 
 /*
@@ -433,6 +452,121 @@ static void policy_emit(void *user, const char *line)
 	syslog(LOG_INFO, "%s", line);
 }
 
+/*
+ * Classification context.
+ *
+ * Holds everything a dissected flow needs to become an enforcement action, so
+ * the NFLOG callback stays a thin adapter over appblock_decide().
+ */
+struct classify_ctx {
+	struct dpi_ctx *dpi;
+	const struct sig_db *sigs;
+	const struct pol_db *pol;
+	struct apply_ctx *ap;
+	const struct nft_target *app_target;
+	struct neigh_table *neigh;
+	uint32_t addr_timeout;
+
+	uint64_t seen;
+	uint64_t classified;
+	uint64_t enforced_addr;
+	uint64_t enforced_hash;
+	uint64_t skipped[8]; /* indexed by enum appblock_reason */
+	uint64_t apply_failed;
+};
+
+static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
+{
+	struct classify_ctx *cc = user;
+	struct dpi_result f;
+	struct appblock_decision d;
+	struct timespec ts;
+	uint64_t now_ms;
+	struct pol_time pt;
+	time_t t;
+	struct tm tmv;
+
+	if (!cc || !cc->dpi)
+		return;
+	cc->seen++;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	now_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+
+	if (!dpi_process(cc->dpi, pkt, len, now_ms, &f))
+		return;
+	cc->classified++;
+
+	/* Policy windows are local wall-clock, not monotonic. */
+	t = time(NULL);
+	localtime_r(&t, &tmv);
+	pt.wday = tmv.tm_wday;
+	pt.min_of_day = (uint16_t)(tmv.tm_hour * 60 + tmv.tm_min);
+
+	/*
+	 * Attribute the flow to a device.
+	 *
+	 * Whichever endpoint is on the LAN is the subject; the other is the
+	 * peer. If neither resolves to a usable neighbour entry we hand NULL
+	 * and appblock_decide refuses -- applying some other device's rules to
+	 * an unattributable flow would block the wrong household member.
+	 */
+	{
+		uint8_t mac[NEIGH_MAC_LEN];
+		const uint8_t *subject = NULL;
+
+		if (cc->neigh) {
+			if (neigh_lookup(cc->neigh, &f.src, mac))
+				subject = mac;
+			else if (neigh_lookup(cc->neigh, &f.dst, mac))
+				subject = mac;
+		}
+		d = appblock_decide(&f, cc->sigs, cc->pol, subject, pt, 0,
+		                    cc->addr_timeout);
+	}
+
+	if (d.reason < (enum appblock_reason)(sizeof(cc->skipped) /
+	                                      sizeof(cc->skipped[0])))
+		cc->skipped[d.reason]++;
+
+	switch (d.action) {
+	case ACT_ADDR: {
+		char cmd[512];
+		size_t n_rendered = 0;
+
+		if (!cc->ap || !cc->app_target)
+			return;
+		if (nft_render_add(cc->app_target, &d.elem, 1, cmd, sizeof(cmd),
+		                   &n_rendered) == 0 || n_rendered != 1) {
+			cc->apply_failed++;
+			return;
+		}
+		char err[192] = "";
+
+		if (apply_commands(cc->ap, cmd, err, sizeof(err)) != APPLY_OK) {
+			cc->apply_failed++;
+			syslog(LOG_WARNING,
+			       "app-block: nft add failed for %s (%s): %s",
+			       d.app_tag, f.host, err[0] ? err : "no detail");
+			return;
+		}
+		cc->enforced_addr++;
+		syslog(LOG_INFO, "app-block: %s (%s) blocked by address",
+		       d.app_tag, f.host);
+		break;
+	}
+	case ACT_HASH:
+		/* The kernel can match this name itself. Hashes are pushed as a
+		 * compiled set at start, not one at a time, so this path only
+		 * counts for now. */
+		cc->enforced_hash++;
+		break;
+	case ACT_NONE:
+	default:
+		break;
+	}
+}
+
 static void usage(const char *a0)
 {
 	fprintf(stderr,
@@ -440,6 +574,9 @@ static void usage(const char *a0)
 	        "          [-T set-timeout-sec] [-N nft-path] [-k] [-f] [-1]\n"
 	        "          [-S] [-g nflog-group] [-c capacity] [-p scan-ports]\n"
 	        "          [-D sense-spool] [-b sense-max-batches] [-P policy]\n"
+	        "          [-Q] [-G dpi-group] [-F dpi-max-flows] [-A addr-timeout]\n"
+	        "  -Q  enable nDPI application classification. Reads packet\n"
+	        "      PAYLOAD, unlike sensing -- consented separately.\n"
 	        "  -k  push compiled app rules to the aether-af kernel module\n"
 	        "  -S  enable firewall-drop sensing (OFF by default: reports\n"
 	        "      attacker addresses, which is separately consented)\n",
@@ -465,10 +602,14 @@ int main(int argc, char **argv)
 		.policy_path = "/etc/config/aether-policy",
 		.sense_spool = "/var/spool/aether-sensord/sense",
 		.sense_max_batches = 32,
+		.dpi_enabled = 0,
+		.dpi_group = 6,
+		.dpi_max_flows = 4096,
+		.dpi_addr_timeout = 3600,
 	};
 
 	int opt;
-	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:f1kSh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:f1kSQh")) != -1) {
 		switch (opt) {
 		case 'd': cfg.db_path = optarg; break;
 		case 's': cfg.spool_dir = optarg; break;
@@ -482,6 +623,10 @@ int main(int argc, char **argv)
 		case 'c': cfg.sense_capacity = (size_t)strtoul(optarg, NULL, 10); break;
 		case 'p': cfg.sense_scan_ports = (uint32_t)strtoul(optarg, NULL, 10); break;
 		case 'P': cfg.policy_path = optarg; break;
+		case 'Q': cfg.dpi_enabled = 1; break;
+		case 'G': cfg.dpi_group = (unsigned)strtoul(optarg, NULL, 10); break;
+		case 'F': cfg.dpi_max_flows = (size_t)strtoul(optarg, NULL, 10); break;
+		case 'A': cfg.dpi_addr_timeout = (uint32_t)strtoul(optarg, NULL, 10); break;
 		case 'D': cfg.sense_spool = optarg; break;
 		case 'b': cfg.sense_max_batches = (unsigned)strtoul(optarg, NULL, 10); break;
 		case 'f': cfg.foreground = 1; break;
@@ -775,12 +920,61 @@ int main(int argc, char **argv)
 		}
 	}
 
+	struct classify_ctx cls;
+	struct nfr_conn dnfr;
+	int dpi_live = 0;
+	struct nft_target app_target = { "inet", "fw4", "aether_app4",
+	                                 "aether_app6" };
+
+	memset(&cls, 0, sizeof(cls));
+	memset(&dnfr, 0, sizeof(dnfr));
+	dnfr.fd = -1;
+	if (cfg.dpi_enabled) {
+		cls.dpi = dpi_new(cfg.dpi_max_flows);
+		if (!cls.dpi) {
+			syslog(LOG_ERR,
+			       "classification: nDPI would not initialise with "
+			       "%zu flows; classification NOT started",
+			       cfg.dpi_max_flows);
+		} else if (!nfr_open(&dnfr, (uint16_t)cfg.dpi_group, 0xffff)) {
+			/* 0xffff, not 128: dissection needs the payload. That
+			 * is the whole reason this half is consented apart. */
+			syslog(LOG_WARNING,
+			       "classification: cannot bind NFLOG group %u (%s) "
+			       "-- classification NOT started. Reputation "
+			       "enforcement is unaffected.",
+			       cfg.dpi_group, strerror(errno));
+			dpi_free(cls.dpi);
+			cls.dpi = NULL;
+		} else {
+			cls.sigs = &sigs;
+			cls.pol = &pol;
+			cls.ap = &ap;
+			cls.app_target = &app_target;
+			cls.addr_timeout = cfg.dpi_addr_timeout;
+			cls.neigh = neigh_new(1024);
+			if (cls.neigh && neigh_refresh(cls.neigh) < 0)
+				syslog(LOG_WARNING,
+				       "classification: could not read the "
+				       "neighbour tables; no flow will be "
+				       "attributable and nothing will be "
+				       "blocked");
+			dpi_live = 1;
+			syslog(LOG_INFO,
+			       "classification: live on NFLOG group %u, %zu "
+			       "flows, address blocks expire after %us",
+			       cfg.dpi_group, cfg.dpi_max_flows,
+			       cfg.dpi_addr_timeout);
+
+		}
+	}
+
 	syslog(LOG_INFO,
-	       "started: spool=%s interval=%us set_timeout=%us sensing=%s. "
-	       "Reputation enforcement is live; application classification is "
-	       "NOT wired in this build.",
+	       "started: spool=%s interval=%us set_timeout=%us sensing=%s "
+	       "classification=%s. Reputation enforcement is live.",
 	       cfg.spool_dir, cfg.interval, cfg.set_timeout,
-	       sense_live ? "live" : (cfg.sense_enabled ? "FAILED" : "off"));
+	       sense_live ? "live" : (cfg.sense_enabled ? "FAILED" : "off"),
+	       dpi_live ? "live" : (cfg.dpi_enabled ? "FAILED" : "off"));
 
 	do {
 		scan_spool(&cfg, &fc, &ap, &target);
@@ -810,22 +1004,33 @@ int main(int argc, char **argv)
 		 * sleep, which is still better than sleep(1) in a loop.
 		 */
 		{
-			struct pollfd pfd;
+			struct pollfd pfd[2];
 			unsigned waited = 0;
 
 			while (running && waited < cfg.interval) {
-				int timeout_ms = 1000;
+				nfds_t n = 0;
+				int i_sense = -1, i_dpi = -1;
 				int rc;
 
-				if (!sense_live) {
+				if (sense_live) {
+					pfd[n].fd = nfr.fd;
+					pfd[n].events = POLLIN;
+					pfd[n].revents = 0;
+					i_sense = (int)n++;
+				}
+				if (dpi_live) {
+					pfd[n].fd = dnfr.fd;
+					pfd[n].events = POLLIN;
+					pfd[n].revents = 0;
+					i_dpi = (int)n++;
+				}
+				if (n == 0) {
 					sleep(1);
 					waited++;
 					continue;
 				}
-				pfd.fd = nfr.fd;
-				pfd.events = POLLIN;
-				pfd.revents = 0;
-				rc = poll(&pfd, 1, timeout_ms);
+
+				rc = poll(pfd, n, 1000);
 				if (rc < 0) {
 					if (errno == EINTR)
 						continue; /* signal; re-test running */
@@ -836,7 +1041,8 @@ int main(int argc, char **argv)
 					waited++;
 					continue;
 				}
-				if (pfd.revents & POLLIN) {
+
+				if (i_sense >= 0 && (pfd[i_sense].revents & POLLIN)) {
 					long got = nfr_dispatch(&nfr,
 					                        on_sensed_packet,
 					                        &sense);
@@ -845,16 +1051,101 @@ int main(int argc, char **argv)
 						       "sensing: dispatch error, "
 						       "packets may have been lost");
 				}
-				if (pfd.revents & (POLLERR | POLLHUP)) {
+				if (i_sense >= 0 &&
+				    (pfd[i_sense].revents & (POLLERR | POLLHUP))) {
 					syslog(LOG_ERR, "sensing: NFLOG socket "
 					                "error; sensing stops, "
 					                "enforcement continues");
 					nfr_close(&nfr);
 					sense_live = 0;
 				}
+
+				if (i_dpi >= 0 && (pfd[i_dpi].revents & POLLIN)) {
+					long got = nfr_dispatch(&dnfr,
+					                        on_classify_packet,
+					                        &cls);
+					if (got < 0)
+						syslog(LOG_WARNING,
+						       "classification: dispatch "
+						       "error, flows may have "
+						       "been missed");
+				}
+				if (i_dpi >= 0 &&
+				    (pfd[i_dpi].revents & (POLLERR | POLLHUP))) {
+					/* One source failing must not take the
+					 * other down with it. */
+					syslog(LOG_ERR, "classification: NFLOG "
+					                "socket error; "
+					                "classification stops, "
+					                "everything else continues");
+					nfr_close(&dnfr);
+					dpi_live = 0;
+				}
+			}
+
+			/* Bound the flow table between intervals rather than
+			 * only when it fills. */
+			if (dpi_live) {
+				dpi_expire(cls.dpi, (uint64_t)time(NULL) * 1000,
+				           120000);
+				/* Re-read the neighbour tables: a device that
+				 * joined since start would otherwise never be
+				 * attributable, and its policy would silently
+				 * not apply. */
+				neigh_refresh(cls.neigh);
 			}
 		}
 	} while (running);
+
+	if (dpi_live || cfg.dpi_enabled) {
+		struct dpi_stats ds;
+
+		memset(&ds, 0, sizeof(ds));
+		if (cls.dpi)
+			dpi_get_stats(cls.dpi, &ds);
+		/* Report the shortfall explicitly. "0 blocked" with no reason
+		 * beside it is indistinguishable from a compliant household. */
+		syslog(LOG_INFO,
+		       "classification: %llu packets, %llu flows classified "
+		       "(%llu named), %llu blocked by address, %llu apply "
+		       "failures",
+		       (unsigned long long)cls.seen,
+		       (unsigned long long)cls.classified,
+		       (unsigned long long)ds.with_host,
+		       (unsigned long long)cls.enforced_addr,
+		       (unsigned long long)cls.apply_failed);
+		if (cls.skipped[ABR_NO_SUBJECT])
+			syslog(LOG_WARNING,
+			       "classification: %llu flows identified but NOT "
+			       "enforced -- device attribution is unimplemented, "
+			       "so policy could not be applied to any of them",
+			       (unsigned long long)cls.skipped[ABR_NO_SUBJECT]);
+		if (cls.skipped[ABR_AMBIGUOUS])
+			syslog(LOG_WARNING,
+			       "classification: %llu flows refused as ambiguous "
+			       "(hostname claimed by several applications)",
+			       (unsigned long long)cls.skipped[ABR_AMBIGUOUS]);
+		{
+			struct neigh_stats ns;
+
+			memset(&ns, 0, sizeof(ns));
+			if (cls.neigh)
+				neigh_get_stats(cls.neigh, &ns);
+			syslog(LOG_INFO,
+			       "attribution: %llu lookups, %llu resolved, "
+			       "%llu no entry, %llu were public addresses",
+			       (unsigned long long)ns.lookups,
+			       (unsigned long long)ns.hits,
+			       (unsigned long long)ns.miss_not_found,
+			       (unsigned long long)ns.miss_not_private);
+		}
+		if (cls.neigh)
+			neigh_free(cls.neigh);
+		if (cls.dpi)
+			dpi_free(cls.dpi);
+		if (dpi_live)
+			nfr_close(&dnfr);
+	}
 
 	if (sense_live) {
 		/* Do not discard a partial interval on shutdown: those records
