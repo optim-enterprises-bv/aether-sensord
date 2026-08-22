@@ -1,0 +1,6 @@
+test/test_*
+!test/test_*.c
+test/connbench
+test/echoserv
+test/nfq_accept
+*.o
