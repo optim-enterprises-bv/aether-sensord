@@ -29,7 +29,37 @@ test_nflog_raw: test_nflog_raw.c ../src/nflog_raw.c ../src/nflog_raw.h
 test_polcfg: test_polcfg.c ../src/polcfg.c ../src/policy.c ../src/sigdb.c ../src/polcfg.h
 	$(CC) $(CFLAGS) -o $@ test_polcfg.c ../src/polcfg.c ../src/policy.c ../src/sigdb.c
 
+# nDPI is optional for the host suite: it is a target dependency, and a
+# developer without it should still be able to run the other 529 checks. When
+# absent the dpi tests SKIP and say so -- they are never silently omitted.
+NDPI_PREFIX ?=
+ifneq ($(NDPI_PREFIX),)
+NDPI_CFLAGS := -I$(NDPI_PREFIX)/include
+NDPI_LDFLAGS := -L$(NDPI_PREFIX)/lib -lndpi -lm -lpthread
+else
+NDPI_CFLAGS := $(shell pkg-config --cflags libndpi 2>/dev/null)
+NDPI_LDFLAGS := $(shell pkg-config --libs libndpi 2>/dev/null)
+endif
+HAVE_NDPI := $(if $(NDPI_LDFLAGS),yes,no)
+
+test_dpi: test_dpi.c ../src/dpi.c ../src/observe.c ../src/dpi.h
+	$(CC) $(CFLAGS) $(NDPI_CFLAGS) -o $@ test_dpi.c ../src/dpi.c \
+		../src/observe.c $(NDPI_LDFLAGS)
+
+dpi_replay: dpi_replay.c ../src/dpi.c ../src/observe.c ../src/dpi.h
+	$(CC) $(CFLAGS) $(NDPI_CFLAGS) -o $@ dpi_replay.c ../src/dpi.c \
+		../src/observe.c $(NDPI_LDFLAGS)
+
 check: $(BINS)
+ifeq ($(HAVE_NDPI),yes)
+	@$(MAKE) --no-print-directory test_dpi
+	@echo "-- test_dpi"; ./test_dpi || exit 1
+else
+	@echo "-- test_dpi SKIPPED: libndpi not found."
+	@echo "   Set NDPI_PREFIX=/path/to/ndpi or install libndpi-dev."
+	@echo "   The scope decision (QUIC must never be name-hashed) is NOT"
+	@echo "   covered by this run."
+endif
 	@for b in $(BINS); do echo "-- $$b"; ./$$b || exit 1; done
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) test_dpi dpi_replay

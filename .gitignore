@@ -4,3 +4,4 @@ test/connbench
 test/echoserv
 test/nfq_accept
 *.o
+test/dpi_replay
