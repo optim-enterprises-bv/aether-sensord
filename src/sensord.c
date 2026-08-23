@@ -43,6 +43,7 @@
 
 #include "afpush.h"
 #include "appblock.h"
+#include "canary.h"
 #include "dpi.h"
 #include "neigh.h"
 #include "offload.h"
@@ -113,6 +114,14 @@ struct config {
 	 * which are personal data under GDPR. Merging the daemons must not
 	 * merge their consent, so the flag stays its own (ADR-019 section 9).
 	 */
+	/*
+	 * How often to prove enforcement actually enforces, in seconds.
+	 * 0 disables it. Default on, because the failure it catches is silent:
+	 * on 2026-08-22 this daemon logged "Reputation enforcement is live"
+	 * against nftables sets that did not exist.
+	 */
+	unsigned canary_interval;
+
 	int sense_enabled;
 	unsigned sense_group;
 	size_t sense_capacity;
@@ -822,6 +831,7 @@ static void usage(const char *a0)
 	        "          [-S] [-g nflog-group] [-c capacity] [-p scan-ports]\n"
 	        "          [-D sense-spool] [-b sense-max-batches] [-P policy]\n"
 	        "          [-Q] [-G dpi-group] [-F dpi-max-flows] [-A addr-timeout]\n"
+	        "          [-C canary-seconds, 0=off]\n"
 	        "  -Q  enable nDPI application classification. Reads packet\n"
 	        "      PAYLOAD, unlike sensing -- consented separately.\n"
 	        "  -k  push compiled app rules to the aether-af kernel module\n"
@@ -842,6 +852,7 @@ int main(int argc, char **argv)
 		.once = 0,
 		.nft_path = NULL,
 		.push_af = 0,
+		.canary_interval = 3600,
 		.sense_enabled = 0,
 		.sense_group = 5,
 		.sense_capacity = 4096,
@@ -856,7 +867,7 @@ int main(int argc, char **argv)
 	};
 
 	int opt;
-	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:f1kSQh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:C:f1kSQh")) != -1) {
 		switch (opt) {
 		case 'd': cfg.db_path = optarg; break;
 		case 's': cfg.spool_dir = optarg; break;
@@ -870,6 +881,7 @@ int main(int argc, char **argv)
 		case 'c': cfg.sense_capacity = (size_t)strtoul(optarg, NULL, 10); break;
 		case 'p': cfg.sense_scan_ports = (uint32_t)strtoul(optarg, NULL, 10); break;
 		case 'P': cfg.policy_path = optarg; break;
+		case 'C': cfg.canary_interval = (unsigned)strtoul(optarg, NULL, 10); break;
 		case 'Q': cfg.dpi_enabled = 1; break;
 		case 'G': cfg.dpi_group = (unsigned)strtoul(optarg, NULL, 10); break;
 		case 'F': cfg.dpi_max_flows = (size_t)strtoul(optarg, NULL, 10); break;
@@ -1181,6 +1193,8 @@ int main(int argc, char **argv)
 	}
 
 	enum offload_state offload_seen = OFFLOAD_UNKNOWN;
+	time_t next_canary = 0;
+	enum canary_result last_canary = CANARY_INCONCLUSIVE;
 	struct classify_ctx cls;
 	struct nfr_conn dnfr;
 	int dpi_live = 0;
@@ -1320,6 +1334,50 @@ int main(int argc, char **argv)
 		/* Emit before waiting, so `-1` produces a batch too. */
 		if (sense_live)
 			sense_flush(&cfg, &sense);
+
+		/*
+		 * Prove enforcement, do not assume it.
+		 *
+		 * Everything else in this daemon reports what it CONFIGURED.
+		 * This is the only thing that reports what the kernel actually
+		 * DID: it puts a canary address in the live set, checks the
+		 * kernel holds it, sends one packet, and requires that packet
+		 * to be refused.
+		 *
+		 * The state worth shouting about is NOT_ENFORCED -- set
+		 * populated, packet still leaves -- because it is invisible to
+		 * every other signal this daemon produces.
+		 */
+		if (cfg.canary_interval) {
+			time_t now_t = time(NULL);
+
+			if (now_t >= next_canary) {
+				enum canary_result cr;
+
+				next_canary = now_t + (time_t)cfg.canary_interval;
+				cr = canary_run(&ap, &target, false);
+
+				if (canary_passed(cr)) {
+					if (cr != last_canary)
+						syslog(LOG_INFO,
+						       "enforcement PROVEN: %s",
+						       canary_result_str(cr));
+				} else if (cr == CANARY_NOT_ENFORCED) {
+					syslog(LOG_ERR,
+					       "ENFORCEMENT IS NOT WORKING: %s. "
+					       "The set holds the canary and the "
+					       "packet left anyway -- no firewall "
+					       "rule references the set. Nothing "
+					       "is being blocked.",
+					       canary_result_str(cr));
+				} else {
+					syslog(LOG_WARNING,
+					       "enforcement UNPROVEN: %s",
+					       canary_result_str(cr));
+				}
+				last_canary = cr;
+			}
+		}
 
 		/*
 		 * Re-check offload every interval, not only at start. Someone
