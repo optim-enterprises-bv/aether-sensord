@@ -48,6 +48,19 @@ static bool pick_peer(const struct dpi_result *f, const struct obs_addr **peer)
 	return false;
 }
 
+const char *appblock_reason_wire(enum appblock_reason r)
+{
+	switch (r) {
+	case ABR_ENFORCED:    return "enforced";
+	case ABR_NO_HOST:     return "no_host";
+	case ABR_UNKNOWN_APP: return "unknown_app";
+	case ABR_NO_SUBJECT:  return "no_subject";
+	case ABR_ALLOWED:     return "allowed";
+	case ABR_AMBIGUOUS:   return "ambiguous";
+	default:              return "unknown";
+	}
+}
+
 struct appblock_decision appblock_decide(const struct dpi_result *flow,
                                          const struct sig_db *sigs,
                                          const struct pol_db *pol,

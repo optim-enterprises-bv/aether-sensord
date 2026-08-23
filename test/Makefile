@@ -1,7 +1,7 @@
 # Host-side unit tests. No OpenWrt toolchain, no device, no nDPI.
 CFLAGS ?= -std=gnu11 -Wall -Wextra -Werror -O1 -g -D_GNU_SOURCE
 BINS = test_sigdb test_policy test_nft test_feed test_apply test_afpush \
-       test_observe test_nflog_raw test_polcfg test_neigh test_offload test_canary
+       test_observe test_nflog_raw test_polcfg test_neigh test_offload test_canary test_flowlog
 .PHONY: all check clean
 all: check
 test_sigdb: test_sigdb.c ../src/sigdb.c ../src/match.c ../src/sigdb.h ../src/match.h
@@ -79,3 +79,6 @@ endif
 	@for b in $(BINS); do echo "-- $$b"; ./$$b || exit 1; done
 clean:
 	rm -f $(BINS) test_dpi test_appblock dpi_replay
+
+test_flowlog: test_flowlog.c ../src/flowlog.c ../src/appblock.c ../src/match.c ../src/sigdb.c ../src/observe.c ../src/afpush.c ../src/policy.c
+	$(CC) $(CFLAGS) -o $@ test_flowlog.c ../src/flowlog.c ../src/appblock.c ../src/match.c ../src/sigdb.c ../src/observe.c ../src/afpush.c ../src/policy.c

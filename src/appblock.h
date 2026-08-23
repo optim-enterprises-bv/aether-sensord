@@ -74,6 +74,17 @@ struct appblock_decision {
 const char *appblock_reason_str(enum appblock_reason r);
 
 /*
+ * The same reason as a stable wire token.
+ *
+ * Deliberately NOT appblock_reason_str(): that returns prose for a human
+ * reading syslog ("hostname claimed by several applications"), and the
+ * controller parses this one. Same split as canary_result_token(), for the same
+ * reason -- shipping the prose would send an unparseable string to a consumer
+ * that has its own wording, and the two would drift.
+ */
+const char *appblock_reason_wire(enum appblock_reason r);
+
+/*
  * Decide what to do about one classified flow.
  *
  * `subject_mac` may be NULL when the flow could not be attributed to a device;

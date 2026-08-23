@@ -51,6 +51,7 @@
 #include "observe.h"
 #include "apply.h"
 #include "feed.h"
+#include "flowlog.h"
 #include "match.h"
 #include "nft.h"
 #include "polcfg.h"
@@ -147,6 +148,11 @@ struct config {
 	 * conflates two things that must stay apart.
 	 */
 	const char *canary_spool;
+	/* Where classified-flow batches are written for the uplink. Its own
+	 * directory, not the sense spool: classification is consented
+	 * separately from firewall-drop sensing and the two must be separable
+	 * on disk as well as in the config. */
+	const char *dpi_spool;
 	/*
 	 * The identity the controller knows this device by. Optional: the
 	 * uplink has one and fills it in if we do not. Kept configurable
@@ -548,6 +554,10 @@ struct classify_ctx {
 	size_t n_pushed;
 	uint64_t push_failed;
 	unsigned allowed_logged;
+
+	/* Classified flows on their way off the device. Populated only when
+	 * classification is on, which is separately consented. */
+	struct flowlog *flows;
 };
 
 /*
@@ -754,6 +764,18 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 	                                      sizeof(cc->skipped[0])))
 		cc->skipped[d.reason]++;
 
+	/*
+	 * Record the flow and what was decided about it.
+	 *
+	 * Every classified flow, not the first 25: the syslog line above is a
+	 * rate-limited diagnostic, and using it as the data source is why the
+	 * controller could not show an operator a single classified flow. This
+	 * buffers and writes in batches, so nothing here touches flash in the
+	 * packet path.
+	 */
+	if (cc->flows)
+		flowlog_record(cc->flows, &f, &d);
+
 	/* Name the app and subject on the ALLOWED path. "policy permitted it"
 	 * is the one refusal that looks identical whether the rule genuinely
 	 * does not apply or the tag/subject comparison is wrong. */
@@ -888,6 +910,7 @@ int main(int argc, char **argv)
 		.policy_path = "/etc/config/aether-policy",
 		.sense_spool = "/var/spool/aether-sensord/sense",
 		.canary_spool = "/var/spool/aether-sensord/canary",
+		.dpi_spool = "/var/spool/aether-sensord/flows",
 		.serial = NULL,
 		.sense_max_batches = 32,
 		.dpi_enabled = 0,
@@ -897,7 +920,7 @@ int main(int argc, char **argv)
 	};
 
 	int opt;
-	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:C:I:R:f1kSQh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:C:I:R:W:f1kSQh")) != -1) {
 		switch (opt) {
 		case 'd': cfg.db_path = optarg; break;
 		case 's': cfg.spool_dir = optarg; break;
@@ -919,6 +942,7 @@ int main(int argc, char **argv)
 		case 'D': cfg.sense_spool = optarg; break;
 		case 'I': cfg.serial = optarg; break;
 		case 'R': cfg.canary_spool = optarg; break;
+		case 'W': cfg.dpi_spool = optarg; break;
 		case 'b': cfg.sense_max_batches = (unsigned)strtoul(optarg, NULL, 10); break;
 		case 'f': cfg.foreground = 1; break;
 		case '1': cfg.once = 1; break;
@@ -1228,7 +1252,10 @@ int main(int argc, char **argv)
 		}
 	}
 
+	struct flowlog flows;
 	enum offload_state offload_seen = OFFLOAD_UNKNOWN;
+
+	memset(&flows, 0, sizeof(flows));
 	/*
 	 * Do not run the canary the instant we start.
 	 *
@@ -1280,6 +1307,15 @@ int main(int argc, char **argv)
 			cls.ap = &ap;
 			cls.app_target = &app_target;
 			cls.addr_timeout = cfg.dpi_addr_timeout;
+			/* Only reached when classification is enabled, so a
+			 * device that has not consented never creates the
+			 * spool at all. */
+			if (flowlog_init(&flows, cfg.dpi_spool))
+				cls.flows = &flows;
+			else
+				syslog(LOG_WARNING,
+				       "classified flows will NOT be reported: "
+				       "cannot use %s", cfg.dpi_spool);
 			if (afpush_open(&cls.afc)) {
 				cls.af_live = 1;
 				/* Start from a known state. Without this the
@@ -1387,6 +1423,11 @@ int main(int argc, char **argv)
 		/* Emit before waiting, so `-1` produces a batch too. */
 		if (sense_live)
 			sense_flush(&cfg, &sense);
+		/* Written on the interval as well as when a batch fills, so a
+		 * quiet link still reports rather than holding rows until they
+		 * are stale. */
+		if (cls.flows)
+			flowlog_flush(cls.flows);
 
 		/*
 		 * Prove enforcement, do not assume it.
