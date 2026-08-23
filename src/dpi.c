@@ -355,19 +355,67 @@ size_t dpi_expire(struct dpi_ctx *c, uint64_t now_ms, uint64_t idle_ms)
 
 /* ---- the hot path ------------------------------------------------------- */
 
+/* Which protocols actually populate protos.tls_quic. Shared with DTLS and the
+ * S-suffixed mail protocols, per the nDPI header comment on that member. */
+static bool is_tls_family(ndpi_protocol pr)
+{
+	uint16_t p[2] = { pr.proto.master_protocol, pr.proto.app_protocol };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		switch (p[i]) {
+		case NDPI_PROTOCOL_TLS:
+		case NDPI_PROTOCOL_QUIC:
+		case NDPI_PROTOCOL_DTLS:
+		case NDPI_PROTOCOL_MAIL_IMAPS:
+		case NDPI_PROTOCOL_MAIL_POPS:
+		case NDPI_PROTOCOL_MAIL_SMTPS:
+			return true;
+		default:
+			break;
+		}
+	}
+	return false;
+}
+
 static void take_host(struct dpi_ctx *c, struct dpi_flow *f,
-                      struct dpi_result *out)
+                      struct dpi_result *out, ndpi_protocol pr)
 {
 	const char *h = NULL;
 	size_t n;
 
 	(void)c;
-	if (f->nf && f->nf->host_server_name[0])
+	if (!f->nf)
+		return;
+
+	/*
+	 * TLS and QUIC put the SNI in protos.tls_quic.server_names, NOT in
+	 * host_server_name -- that field carries the HTTP Host header and DNS
+	 * queries only.
+	 *
+	 * Reading only host_server_name meant every TLS and QUIC flow came back
+	 * unnamed, which is all the traffic worth blocking. On the BPI-R4 that
+	 * showed as 11 named out of 42: the named ones were HTTP and DNS, and
+	 * every https:// and QUIC flow was invisible to policy.
+	 *
+	 * tls_quic is shared with DTLS and the S-suffixed mail protocols, so
+	 * this covers IMAPS and friends too.
+	 */
+	/*
+	 * protos is a UNION. Reading tls_quic.server_names on a flow that is
+	 * not in that family dereferences whichever member is actually live,
+	 * which crashes the replay on unrelated captures -- classified flows
+	 * fell from 1169 to 606 when this was read unconditionally.
+	 */
+	if (is_tls_family(pr) && f->nf->protos.tls_quic.server_names &&
+	    f->nf->protos.tls_quic.server_names[0])
+		h = f->nf->protos.tls_quic.server_names;
+	else if (f->nf->host_server_name[0])
 		h = (const char *)f->nf->host_server_name;
 	if (!h || !*h)
 		return;
 
-	n = strnlen(h, sizeof(f->nf->host_server_name));
+	n = strnlen(h, DPI_HOST_MAX);
 	if (n >= DPI_HOST_MAX) {
 		n = DPI_HOST_MAX - 1;
 		out->host_truncated = true;
@@ -469,7 +517,7 @@ bool dpi_process(struct dpi_ctx *c, const uint8_t *pkt, uint32_t len,
 	out->dport = dport;
 	out->l4proto = l4;
 
-	take_host(c, f, out);
+	take_host(c, f, out, pr);
 
 	out->scope = dpi_kernel_can_match(l4, out->master_proto, out->app_proto)
 	                     ? DPI_SCOPE_NAME_HASH

@@ -34,6 +34,10 @@
 #define NFR_RECV_BUF 65536
 
 struct nfr_conn {
+	/* What we asked the kernel to copy. Recorded so a caller can report
+	 * it: a dissector fed truncated packets identifies protocols it
+	 * cannot name, and the request is the only way to tell. */
+	uint16_t copy_range;
 	int fd;
 	uint16_t group;
 	/* Counted, never silently dropped: a receive error or a malformed

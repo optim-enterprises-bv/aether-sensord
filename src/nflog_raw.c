@@ -215,8 +215,28 @@ bool nfr_open(struct nfr_conn *c, uint16_t group, uint16_t copy_range)
 	 * little-endian host and wrong on big-endian, and OpenWrt still ships
 	 * big-endian MIPS targets. */
 	mode.copy_range = htonl((uint32_t)copy_range);
-	nfr_send_config(c->fd, group, AF_UNSPEC, 0, &mode, sizeof(mode),
-	                NFULA_CFG_MODE);
+	c->copy_range = copy_range;
+	/*
+	 * CHECK THIS ACK. The group bind was checked and the copy mode was not,
+	 * which is the difference between "we get whole packets" and "we get
+	 * whatever the kernel felt like sending".
+	 *
+	 * A rejected mode leaves the default copy length in force. That is
+	 * enough bytes to recognise TLS from its first handshake byte and NOT
+	 * enough to reach the SNI inside the ClientHello -- so every flow
+	 * classifies and none of them yields a hostname, which is exactly what
+	 * the BPI-R4 showed: 8 named out of 37, against 48% on the same code
+	 * replaying full packets from a pcap.
+	 *
+	 * Failing the open() is deliberate. A dissector fed truncated packets
+	 * does not degrade gracefully; it reports protocols it cannot act on.
+	 */
+	if (!nfr_send_config(c->fd, group, AF_UNSPEC, 0, &mode, sizeof(mode),
+	                     NFULA_CFG_MODE)) {
+		close(c->fd);
+		c->fd = -1;
+		return false;
+	}
 
 	return true;
 }

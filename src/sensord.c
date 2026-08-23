@@ -506,7 +506,53 @@ struct classify_ctx {
 	uint64_t refresh_on_miss;
 	uint64_t rescued;
 	unsigned classify_logged;
+	uint32_t max_pkt_len;
+
+	/* Live connection to aether-af for per-flow name-hash pushes. */
+	struct afpush_conn afc;
+	int af_live;
+	uint64_t pushed[AFPUSH_MAX_MSG / 16];
+	size_t n_pushed;
+	uint64_t push_failed;
 };
+
+/*
+ * Push the accumulated name hashes to aether-af.
+ *
+ * Re-sends the WHOLE set every time rather than appending. That is not
+ * laziness: AF_MSG_RULES_BEGIN frees the module's staging set, so an
+ * incremental push would commit a ruleset containing only the newest hash and
+ * silently drop everything learned before it.
+ *
+ * Returns false without committing if any batch fails, which leaves the module
+ * enforcing the last set that committed whole.
+ */
+static bool af_push_all(struct classify_ctx *cc)
+{
+	uint8_t msg[AFPUSH_MAX_MSG];
+	size_t n, written = 0;
+
+	if (!cc->af_live || cc->n_pushed == 0)
+		return false;
+
+	n = afpush_build_simple(msg, sizeof(msg), AFPUSH_RULES_BEGIN);
+	if (!n || !afpush_send(&cc->afc, msg, n))
+		return false;
+
+	while (written < cc->n_pushed) {
+		size_t chunk = 0;
+
+		n = afpush_build_rules(msg, sizeof(msg), cc->pushed + written,
+		                       NULL, NULL, cc->n_pushed - written,
+		                       &chunk);
+		if (n == 0 || chunk == 0 || !afpush_send(&cc->afc, msg, n))
+			return false; /* no COMMIT: previous set stays live */
+		written += chunk;
+	}
+
+	n = afpush_build_simple(msg, sizeof(msg), AFPUSH_RULES_COMMIT);
+	return n && afpush_send(&cc->afc, msg, n);
+}
 
 static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 {
@@ -522,6 +568,11 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 	if (!cc || !cc->dpi)
 		return;
 	cc->seen++;
+	/* Largest packet the kernel actually handed us. If this sits at a round
+	 * default well under what we asked for, packets are being truncated and
+	 * no amount of dissection will reach an SNI. */
+	if (len > cc->max_pkt_len)
+		cc->max_pkt_len = len;
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	now_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
@@ -675,12 +726,36 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 		       d.app_tag, f.host);
 		break;
 	}
-	case ACT_HASH:
-		/* The kernel can match this name itself. Hashes are pushed as a
-		 * compiled set at start, not one at a time, so this path only
-		 * counts for now. */
+	case ACT_HASH: {
+		size_t i;
+
+		/* Already pushed? Nothing to do; the module is enforcing it. */
+		for (i = 0; i < cc->n_pushed; i++)
+			if (cc->pushed[i] == d.name_hash)
+				return;
+
+		if (cc->n_pushed >= sizeof(cc->pushed) / sizeof(cc->pushed[0])) {
+			/* Bounded. Refusing loudly beats silently enforcing a
+			 * subset the controller does not know about. */
+			cc->push_failed++;
+			return;
+		}
+		cc->pushed[cc->n_pushed++] = d.name_hash;
+
+		if (!af_push_all(cc)) {
+			cc->n_pushed--; /* not live: do not claim it is */
+			cc->push_failed++;
+			syslog(LOG_WARNING,
+			       "app-block: %s (%s) NOT pushed to aether-af",
+			       d.app_tag, f.host);
+			return;
+		}
 		cc->enforced_hash++;
+		syslog(LOG_INFO,
+		       "app-block: %s (%s) blocked by name hash (%zu live)",
+		       d.app_tag, f.host, cc->n_pushed);
 		break;
+	}
 	case ACT_NONE:
 	default:
 		break;
@@ -1081,6 +1156,14 @@ int main(int argc, char **argv)
 			cls.ap = &ap;
 			cls.app_target = &app_target;
 			cls.addr_timeout = cfg.dpi_addr_timeout;
+			if (afpush_open(&cls.afc)) {
+				cls.af_live = 1;
+			} else {
+				syslog(LOG_WARNING,
+				       "app-block: aether-af not reachable; "
+				       "name-hash blocks will NOT be enforced. "
+				       "Address-scope blocks are unaffected.");
+			}
 			cls.neigh = neigh_new(1024);
 			{
 				long ne = cls.neigh ? neigh_refresh(cls.neigh) : -1;
@@ -1330,10 +1413,11 @@ int main(int argc, char **argv)
 		/* Report the shortfall explicitly. "0 blocked" with no reason
 		 * beside it is indistinguishable from a compliant household. */
 		syslog(LOG_INFO,
-		       "classification: %llu packets, %llu flows classified "
-		       "(%llu named), %llu blocked by address, %llu apply "
-		       "failures",
-		       (unsigned long long)cls.seen,
+		       "classification: %llu packets (largest %u bytes, asked for "
+		       "%u), %llu flows classified (%llu named), %llu blocked by "
+		       "address, %llu apply failures",
+		       (unsigned long long)cls.seen, cls.max_pkt_len,
+		       dpi_live ? dnfr.copy_range : 0,
 		       (unsigned long long)cls.classified,
 		       (unsigned long long)ds.with_host,
 		       (unsigned long long)cls.enforced_addr,
@@ -1363,6 +1447,12 @@ int main(int argc, char **argv)
 			       (unsigned long long)ns.miss_not_found,
 			       (unsigned long long)ns.miss_not_private);
 		}
+		if (cls.af_live)
+			afpush_close(&cls.afc);
+		if (cls.push_failed)
+			syslog(LOG_WARNING,
+			       "app-block: %llu name-hash pushes failed",
+			       (unsigned long long)cls.push_failed);
 		if (cls.neigh)
 			neigh_free(cls.neigh);
 		if (cls.dpi)
