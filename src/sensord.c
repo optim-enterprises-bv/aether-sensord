@@ -533,8 +533,22 @@ static bool af_push_all(struct classify_ctx *cc)
 	uint8_t msg[AFPUSH_MAX_MSG];
 	size_t n, written = 0;
 
-	if (!cc->af_live || cc->n_pushed == 0)
+	if (!cc->af_live)
 		return false;
+
+	/*
+	 * n_pushed == 0 is a legitimate ruleset, not a no-op.
+	 *
+	 * The module keeps its rules across a daemon restart, deliberately, so
+	 * that enforcement does not lapse when the daemon bounces. The
+	 * consequence is that emptying the policy does NOT empty the kernel:
+	 * on the BPI-R4 the laptop stayed blocked after every rule was removed
+	 * and the daemon restarted, because nothing ever told the module.
+	 *
+	 * A BEGIN followed immediately by COMMIT installs an empty set, which
+	 * is exactly "block nothing". The nftables sets self-heal through
+	 * element timeouts; the module has no such mechanism and must be told.
+	 */
 
 	n = afpush_build_simple(msg, sizeof(msg), AFPUSH_RULES_BEGIN);
 	if (!n || !afpush_send(&cc->afc, msg, n))
@@ -924,6 +938,7 @@ int main(int argc, char **argv)
 
 	pol_db_init(&pol);
 	np = polcfg_load_file(&pol, &sigs, cfg.policy_path, &pst);
+	(void)np;
 	if (np < 0) {
 		/* A device with no parental policy configured is an ordinary
 		 * device. Not an error, and not silence either. */
@@ -1200,6 +1215,20 @@ int main(int argc, char **argv)
 			cls.addr_timeout = cfg.dpi_addr_timeout;
 			if (afpush_open(&cls.afc)) {
 				cls.af_live = 1;
+				/* Start from a known state. Without this the
+				 * module keeps whatever the previous run left
+				 * behind, so removing a rule from the policy
+				 * never takes effect. */
+				if (af_push_all(&cls))
+					syslog(LOG_INFO,
+					       "app-block: module rules reset "
+					       "to match the loaded policy "
+					       "(%zu hashes)", cls.n_pushed);
+				else
+					syslog(LOG_WARNING,
+					       "app-block: could not reset "
+					       "module rules; it may still be "
+					       "enforcing a previous policy");
 			} else {
 				syslog(LOG_WARNING,
 				       "app-block: aether-af not reachable; "
