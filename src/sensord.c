@@ -129,6 +129,12 @@ struct config {
 	/* UCI policy file compiled into kernel rules when -k is given. */
 	const char *policy_path;
 	const char *sense_spool;
+	/*
+	 * The identity the controller knows this device by. Optional: the
+	 * uplink has one and fills it in if we do not. Kept configurable
+	 * because a device that CAN name itself saves the uplink guessing.
+	 */
+	const char *serial;
 	unsigned sense_max_batches;
 
 	/*
@@ -831,12 +837,15 @@ static void usage(const char *a0)
 	        "          [-S] [-g nflog-group] [-c capacity] [-p scan-ports]\n"
 	        "          [-D sense-spool] [-b sense-max-batches] [-P policy]\n"
 	        "          [-Q] [-G dpi-group] [-F dpi-max-flows] [-A addr-timeout]\n"
-	        "          [-C canary-seconds, 0=off]\n"
+	        "          [-C canary-seconds, 0=off] [-I serial]\n"
 	        "  -Q  enable nDPI application classification. Reads packet\n"
 	        "      PAYLOAD, unlike sensing -- consented separately.\n"
 	        "  -k  push compiled app rules to the aether-af kernel module\n"
 	        "  -S  enable firewall-drop sensing (OFF by default: reports\n"
-	        "      attacker addresses, which is separately consented)\n",
+	        "      attacker addresses, which is separately consented)\n"
+	        "  -I  the serial the controller knows this device by. Optional:\n"
+	        "      the uplink fills it in when absent, and the field is\n"
+	        "      omitted rather than sent empty\n",
 	        a0);
 }
 
@@ -859,6 +868,7 @@ int main(int argc, char **argv)
 		.sense_scan_ports = 8,
 		.policy_path = "/etc/config/aether-policy",
 		.sense_spool = "/var/spool/aether-sensord/sense",
+		.serial = NULL,
 		.sense_max_batches = 32,
 		.dpi_enabled = 0,
 		.dpi_group = 6,
@@ -867,7 +877,7 @@ int main(int argc, char **argv)
 	};
 
 	int opt;
-	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:C:f1kSQh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:C:I:f1kSQh")) != -1) {
 		switch (opt) {
 		case 'd': cfg.db_path = optarg; break;
 		case 's': cfg.spool_dir = optarg; break;
@@ -887,6 +897,7 @@ int main(int argc, char **argv)
 		case 'F': cfg.dpi_max_flows = (size_t)strtoul(optarg, NULL, 10); break;
 		case 'A': cfg.dpi_addr_timeout = (uint32_t)strtoul(optarg, NULL, 10); break;
 		case 'D': cfg.sense_spool = optarg; break;
+		case 'I': cfg.serial = optarg; break;
 		case 'b': cfg.sense_max_batches = (unsigned)strtoul(optarg, NULL, 10); break;
 		case 'f': cfg.foreground = 1; break;
 		case '1': cfg.once = 1; break;
@@ -1375,6 +1386,17 @@ int main(int argc, char **argv)
 					       "enforcement UNPROVEN: %s",
 					       canary_result_str(cr));
 				}
+				/*
+				 * Report EVERY run, not only a change. The
+				 * controller treats an absent verdict as an
+				 * alarm -- a device that stopped checking looks
+				 * exactly like a healthy one -- so the steady
+				 * stream of passes is what makes silence mean
+				 * something.
+				 */
+				canary_report(cfg.sense_spool, cfg.serial, cr,
+				              target.set_v4, false);
+
 				last_canary = cr;
 			}
 		}

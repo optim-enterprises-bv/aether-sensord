@@ -11,6 +11,10 @@
  * every outcome other than ENFORCED must read as "not proven".
  */
 #include "../src/canary.h"
+
+#include <dirent.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -85,6 +89,123 @@ static void test_run_guards(void)
 	      "no target is inconclusive");
 }
 
+/*
+ * The tokens the controller parses.
+ *
+ * These are a contract with `enum Verdict` in aether-aegis::proof, and there is
+ * no shared header to enforce it. A rename on either side makes every device
+ * report an unparseable verdict, the controller counts them all as silence, and
+ * silence is its alarm state -- so the whole fleet would go red while every
+ * device was working correctly. Pinning the strings here is the only guard.
+ */
+static void test_wire_tokens_are_the_contract(void)
+{
+	CHECK(!strcmp(canary_result_token(CANARY_ENFORCED), "enforced"), "enforced");
+	CHECK(!strcmp(canary_result_token(CANARY_SET_MISSING), "set_missing"),
+	      "set_missing");
+	CHECK(!strcmp(canary_result_token(CANARY_ADD_REJECTED), "add_rejected"),
+	      "add_rejected");
+	CHECK(!strcmp(canary_result_token(CANARY_NOT_HELD), "not_held"), "not_held");
+	CHECK(!strcmp(canary_result_token(CANARY_NOT_ENFORCED), "not_enforced"),
+	      "not_enforced");
+	CHECK(!strcmp(canary_result_token(CANARY_CLEANUP_FAILED), "cleanup_failed"),
+	      "cleanup_failed");
+	CHECK(!strcmp(canary_result_token(CANARY_INCONCLUSIVE), "inconclusive"),
+	      "inconclusive");
+
+	/* And the token is NOT the human string: the controller parses one and
+	 * a person reads the other. Sending the prose would be unparseable. */
+	CHECK(strcmp(canary_result_token(CANARY_ENFORCED),
+	             canary_result_str(CANARY_ENFORCED)) != 0,
+	      "the wire token is not the syslog prose");
+}
+
+static char *slurp_one(const char *dir)
+{
+	static char buf[1024];
+	DIR *d = opendir(dir);
+	struct dirent *e;
+	char path[600];
+	FILE *f;
+
+	buf[0] = '\0';
+	if (!d)
+		return buf;
+	while ((e = readdir(d))) {
+		if (strncmp(e->d_name, "canary-", 7) != 0)
+			continue;
+		/* A .partial must never be picked up -- that is the point of
+		 * the rename. */
+		if (strstr(e->d_name, ".partial"))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+		f = fopen(path, "r");
+		if (f) {
+			if (!fgets(buf, sizeof(buf), f))
+				buf[0] = '\0';
+			fclose(f);
+		}
+		break;
+	}
+	closedir(d);
+	return buf;
+}
+
+static void test_report_writes_a_parseable_record(void)
+{
+	char dir[] = "/tmp/aether-canary-testXXXXXX";
+	char *line;
+
+	if (!mkdtemp(dir)) {
+		CHECK(0, "could not create a temporary spool");
+		return;
+	}
+
+	CHECK(canary_report(dir, "AP-TEST-1", CANARY_NOT_ENFORCED, "aether_rep4",
+	                    false) == 0,
+	      "report writes");
+	line = slurp_one(dir);
+	CHECK(strstr(line, "\"result\":\"not_enforced\"") != NULL,
+	      "carries the wire token, not the prose");
+	CHECK(strstr(line, "\"serial\":\"AP-TEST-1\"") != NULL, "carries the serial");
+	CHECK(strstr(line, "\"family\":4") != NULL, "carries the family");
+	CHECK(strstr(line, "(a packet") == NULL,
+	      "does not ship our prose -- the controller has its own wording");
+}
+
+static void test_an_unknown_serial_is_omitted_not_empty(void)
+{
+	char dir[] = "/tmp/aether-canary-testXXXXXX";
+	char *line;
+
+	if (!mkdtemp(dir)) {
+		CHECK(0, "could not create a temporary spool");
+		return;
+	}
+
+	CHECK(canary_report(dir, NULL, CANARY_ENFORCED, "aether_rep4", false) == 0,
+	      "report writes without a serial");
+	line = slurp_one(dir);
+	/*
+	 * An empty serial would key a device row on "" in the controller and
+	 * quietly merge every unidentified device's verdicts into one fictional
+	 * access point that always looks fine.
+	 */
+	CHECK(strstr(line, "\"serial\"") == NULL,
+	      "the key is absent, not empty");
+	CHECK(strstr(line, "\"result\":\"enforced\"") != NULL,
+	      "the rest of the record is intact");
+}
+
+static void test_report_guards(void)
+{
+	CHECK(canary_report(NULL, "AP-1", CANARY_ENFORCED, "s", false) == -1,
+	      "no spool directory is a failure, not a silent success");
+	CHECK(canary_report("/proc/nonexistent-aether", "AP-1", CANARY_ENFORCED,
+	                    "s", false) == -1,
+	      "an unwritable spool is a failure");
+}
+
 int main(void)
 {
 	test_only_enforced_passes();
@@ -92,6 +213,10 @@ int main(void)
 	test_every_result_is_described();
 	test_probe_guards();
 	test_run_guards();
+	test_wire_tokens_are_the_contract();
+	test_report_writes_a_parseable_record();
+	test_an_unknown_serial_is_omitted_not_empty();
+	test_report_guards();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
 }

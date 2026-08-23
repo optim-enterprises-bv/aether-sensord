@@ -7,7 +7,10 @@
 #include "canary.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
+#include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -37,6 +40,81 @@ const char *canary_result_str(enum canary_result r)
 	case CANARY_INCONCLUSIVE:   return "could not be checked";
 	default:                    return "?";
 	}
+}
+
+const char *canary_result_token(enum canary_result r)
+{
+	/* Must stay in step with enum Verdict in aether-aegis::proof. */
+	switch (r) {
+	case CANARY_ENFORCED:       return "enforced";
+	case CANARY_SET_MISSING:    return "set_missing";
+	case CANARY_ADD_REJECTED:   return "add_rejected";
+	case CANARY_NOT_HELD:       return "not_held";
+	case CANARY_NOT_ENFORCED:   return "not_enforced";
+	case CANARY_CLEANUP_FAILED: return "cleanup_failed";
+	default:                    return "inconclusive";
+	}
+}
+
+int canary_report(const char *spool_dir, const char *serial,
+                  enum canary_result r, const char *target, bool v6)
+{
+	char path[512], tmp[540];
+	FILE *f;
+	time_t now;
+	int err;
+
+	if (!spool_dir)
+		return -1;
+
+	now = time(NULL);
+	snprintf(path, sizeof(path), "%s/canary-%lld.ndjson", spool_dir,
+	         (long long)now);
+	snprintf(tmp, sizeof(tmp), "%s.partial", path);
+
+	f = fopen(tmp, "w");
+	if (!f) {
+		syslog(LOG_ERR, "cannot open canary spool %s: %s", tmp,
+		       strerror(errno));
+		return -1;
+	}
+
+	/*
+	 * The prose meaning is deliberately NOT sent. The controller has its
+	 * own wording for each verdict, and shipping ours would leave two
+	 * descriptions of the same state that drift apart.
+	 *
+	 * The serial key is OMITTED when we do not know it, rather than sent
+	 * empty. This daemon has no cloud identity of its own; the uplink does,
+	 * and it fills the field. An empty string would key a device row on ""
+	 * and quietly collect every unidentified device's verdicts into one
+	 * fictional AP.
+	 */
+	fputs("{\"canary\":true,", f);
+	if (serial && serial[0])
+		fprintf(f, "\"serial\":\"%s\",", serial);
+	fprintf(f,
+	        "\"result\":\"%s\",\"target\":\"%s\",\"family\":%d,"
+	        "\"reported_at\":%lld}\n",
+	        canary_result_token(r), target ? target : "", v6 ? 6 : 4,
+	        (long long)now);
+
+	err = ferror(f);
+	if (fclose(f) != 0 || err) {
+		syslog(LOG_ERR, "canary spool write failed, discarding verdict");
+		unlink(tmp);
+		return -1;
+	}
+
+	/* Rename only after a complete write, so the uplink never ships half a
+	 * record -- a truncated verdict would be rejected by the controller and
+	 * count as silence, which is an alarm. */
+	if (rename(tmp, path) != 0) {
+		syslog(LOG_ERR, "cannot rename %s: %s", tmp, strerror(errno));
+		unlink(tmp);
+		return -1;
+	}
+	return 0;
 }
 
 bool canary_passed(enum canary_result r)

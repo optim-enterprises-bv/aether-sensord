@@ -59,6 +59,42 @@ enum canary_result {
 
 const char *canary_result_str(enum canary_result r);
 
+/*
+ * The same verdict as a stable wire token.
+ *
+ * Deliberately NOT canary_result_str(): that returns prose for a human reading
+ * syslog ("enforced (a packet was stopped)"), and the controller parses this
+ * one. Reusing the prose would send an unparseable string to a cloud that
+ * treats unknown verdicts as unusable -- and the whole fleet would read as
+ * "never reported" while every device was reporting correctly.
+ *
+ * These tokens match enum Verdict in aether-aegis::proof. Changing one without
+ * the other is the failure mode; there is no shared header to enforce it, so
+ * the pairing is written down in both places.
+ */
+const char *canary_result_token(enum canary_result r);
+
+/*
+ * Write the verdict where the uplink will find it.
+ *
+ * Same mechanism the sense batches use: an NDJSON line into a spool directory,
+ * written to a .partial and renamed, so a consumer never reads half a record.
+ *
+ * Emitted on EVERY run, not only when the verdict changes. The controller
+ * treats an absent verdict as an alarm -- correctly, because a device that
+ * stopped checking looks exactly like a healthy one -- so the steady stream of
+ * passes is not noise, it is the heartbeat that makes silence meaningful.
+ *
+ * `serial` may be NULL or empty: this daemon has no cloud identity of its own
+ * and the uplink supplies one. The key is omitted rather than sent empty, so an
+ * unidentified device cannot collect its verdicts into a row keyed on "".
+ *
+ * Returns 0 on success, -1 on failure. A failure to report is logged and does
+ * not affect enforcement: the check has already happened.
+ */
+int canary_report(const char *spool_dir, const char *serial,
+                  enum canary_result r, const char *target, bool v6);
+
 /* True only for CANARY_ENFORCED. Everything else, including INCONCLUSIVE,
  * is not a pass -- "I could not check" must never read as "it works". */
 bool canary_passed(enum canary_result r);
