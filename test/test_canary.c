@@ -13,6 +13,7 @@
 #include "../src/canary.h"
 
 #include <dirent.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -206,6 +207,47 @@ static void test_report_guards(void)
 	      "an unwritable spool is a failure");
 }
 
+static void test_the_spool_does_not_grow_without_bound(void)
+{
+	char dir[] = "/tmp/aether-canary-testXXXXXX";
+	DIR *d;
+	struct dirent *e;
+	int n = 0;
+	int i;
+
+	if (!mkdtemp(dir)) {
+		CHECK(0, "could not create a temporary spool");
+		return;
+	}
+
+	/*
+	 * One verdict per run, hourly, is 8,760 files a year on a device with a
+	 * few megabytes of writable flash -- and the uplink only ever forwards
+	 * the newest one, so every earlier file is dead weight.
+	 */
+	for (i = 0; i < (int)CANARY_KEEP + 6; i++) {
+		CHECK(canary_report(dir, "AP-1", CANARY_ENFORCED, "aether_rep4",
+		                    false) == 0,
+		      "report writes");
+		/* Filenames carry whole seconds; without this they collide and
+		 * the test proves nothing about pruning. */
+		sleep(1);
+	}
+
+	d = opendir(dir);
+	if (!d) {
+		CHECK(0, "spool disappeared");
+		return;
+	}
+	while ((e = readdir(d))) {
+		if (strncmp(e->d_name, "canary-", 7) == 0)
+			n++;
+	}
+	closedir(d);
+	CHECK(n <= (int)CANARY_KEEP, "old verdicts are pruned");
+	CHECK(n > 0, "the newest verdict survives the prune");
+}
+
 int main(void)
 {
 	test_only_enforced_passes();
@@ -217,6 +259,7 @@ int main(void)
 	test_report_writes_a_parseable_record();
 	test_an_unknown_serial_is_omitted_not_empty();
 	test_report_guards();
+	test_the_spool_does_not_grow_without_bound();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
 }

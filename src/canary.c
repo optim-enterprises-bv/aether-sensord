@@ -7,6 +7,7 @@
 #include "canary.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <syslog.h>
@@ -54,6 +55,31 @@ const char *canary_result_token(enum canary_result r)
 	case CANARY_CLEANUP_FAILED: return "cleanup_failed";
 	default:                    return "inconclusive";
 	}
+}
+
+/*
+ * Keep only the newest few verdicts.
+ *
+ * One file per run, hourly by default, is 8,760 files a year on a device with
+ * a few megabytes of writable flash -- and the uplink only ever sends the
+ * newest one, so every earlier file is dead weight the moment the next is
+ * written. A handful are kept rather than exactly one so a reader that is
+ * mid-scan when a new verdict lands still finds a complete record.
+ *
+ * Failure here is logged at debug and ignored: a spool that did not shrink is
+ * a disk problem, and refusing to record the next verdict because of it would
+ * turn that into an enforcement blind spot.
+ */
+static void canary_prune(const char *spool_dir)
+{
+	char cmd[640];
+
+	snprintf(cmd, sizeof(cmd),
+	         "ls -1t '%s'/canary-*.ndjson 2>/dev/null | tail -n +%u | "
+	         "xargs -r rm -f",
+	         spool_dir, CANARY_KEEP + 1);
+	if (system(cmd) != 0)
+		syslog(LOG_DEBUG, "canary spool prune returned non-zero");
 }
 
 int canary_report(const char *spool_dir, const char *serial,
@@ -114,6 +140,8 @@ int canary_report(const char *spool_dir, const char *serial,
 		unlink(tmp);
 		return -1;
 	}
+
+	canary_prune(spool_dir);
 	return 0;
 }
 

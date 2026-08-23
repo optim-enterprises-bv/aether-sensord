@@ -95,6 +95,15 @@ const char *canary_result_token(enum canary_result r);
 int canary_report(const char *spool_dir, const char *serial,
                   enum canary_result r, const char *target, bool v6);
 
+/*
+ * How many verdict files to keep.
+ *
+ * The uplink only ever forwards the newest, so older ones are dead weight --
+ * but keeping a few means a reader scanning the directory when a new verdict
+ * lands still finds a complete record rather than an empty spool.
+ */
+#define CANARY_KEEP 8u
+
 /* True only for CANARY_ENFORCED. Everything else, including INCONCLUSIVE,
  * is not a pass -- "I could not check" must never read as "it works". */
 bool canary_passed(enum canary_result r);
