@@ -88,6 +88,12 @@ static void on_signal(int sig)
 	running = 0;
 }
 
+/*
+ * How long to let the system settle before the first canary run, in seconds.
+ * Long enough for fw4 to have loaded our include on a cold boot.
+ */
+#define CANARY_SETTLE_SECS 90
+
 struct config {
 	const char *db_path;
 	const char *spool_dir;
@@ -129,6 +135,18 @@ struct config {
 	/* UCI policy file compiled into kernel rules when -k is given. */
 	const char *policy_path;
 	const char *sense_spool;
+	/*
+	 * Where canary verdicts are written for the uplink.
+	 *
+	 * NOT the sense spool, for two reasons. The sense spool is created only
+	 * when sensing is enabled, so on a device with sensing off -- the
+	 * default -- every verdict failed to write and the only sign was an
+	 * error in syslog. And sensing is separately consented because it
+	 * reports attacker addresses, which are personal data; a self-test
+	 * result is not, and routing it through a consent-gated directory
+	 * conflates two things that must stay apart.
+	 */
+	const char *canary_spool;
 	/*
 	 * The identity the controller knows this device by. Optional: the
 	 * uplink has one and fills it in if we do not. Kept configurable
@@ -838,6 +856,7 @@ static void usage(const char *a0)
 	        "          [-D sense-spool] [-b sense-max-batches] [-P policy]\n"
 	        "          [-Q] [-G dpi-group] [-F dpi-max-flows] [-A addr-timeout]\n"
 	        "          [-C canary-seconds, 0=off] [-I serial]\n"
+	        "          [-R canary-spool]\n"
 	        "  -Q  enable nDPI application classification. Reads packet\n"
 	        "      PAYLOAD, unlike sensing -- consented separately.\n"
 	        "  -k  push compiled app rules to the aether-af kernel module\n"
@@ -868,6 +887,7 @@ int main(int argc, char **argv)
 		.sense_scan_ports = 8,
 		.policy_path = "/etc/config/aether-policy",
 		.sense_spool = "/var/spool/aether-sensord/sense",
+		.canary_spool = "/var/spool/aether-sensord/canary",
 		.serial = NULL,
 		.sense_max_batches = 32,
 		.dpi_enabled = 0,
@@ -877,7 +897,7 @@ int main(int argc, char **argv)
 	};
 
 	int opt;
-	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:C:I:f1kSQh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:s:n:i:T:N:g:c:p:D:b:P:G:F:A:C:I:R:f1kSQh")) != -1) {
 		switch (opt) {
 		case 'd': cfg.db_path = optarg; break;
 		case 's': cfg.spool_dir = optarg; break;
@@ -898,6 +918,7 @@ int main(int argc, char **argv)
 		case 'A': cfg.dpi_addr_timeout = (uint32_t)strtoul(optarg, NULL, 10); break;
 		case 'D': cfg.sense_spool = optarg; break;
 		case 'I': cfg.serial = optarg; break;
+		case 'R': cfg.canary_spool = optarg; break;
 		case 'b': cfg.sense_max_batches = (unsigned)strtoul(optarg, NULL, 10); break;
 		case 'f': cfg.foreground = 1; break;
 		case '1': cfg.once = 1; break;
@@ -1141,6 +1162,10 @@ int main(int argc, char **argv)
 	                 "sets are not present yet)", cfg.nft_include);
 
 	mkdir(cfg.spool_dir, 0750);
+	/* Unconditional: the canary reports whether or not sensing is on, and a
+	 * verdict that cannot be written is a device that reads as silent. */
+	if (cfg.canary_interval)
+		mkdir(cfg.canary_spool, 0750);
 
 	/*
 	 * Serial state is deliberately NOT persisted across restarts.
@@ -1204,7 +1229,24 @@ int main(int argc, char **argv)
 	}
 
 	enum offload_state offload_seen = OFFLOAD_UNKNOWN;
-	time_t next_canary = 0;
+	/*
+	 * Do not run the canary the instant we start.
+	 *
+	 * On a fresh boot this daemon comes up before fw4 has loaded the set
+	 * declaration it just installed, so an immediate run reports
+	 * "set does not exist" against a device that is about to be fine. That
+	 * verdict is not wrong at the moment it is taken, but it is a false
+	 * alarm about the next hour, and a controller that treats unproven
+	 * enforcement as an alert would page somebody on every reboot.
+	 *
+	 * Settling first costs one delayed verdict and removes a recurring
+	 * false positive. A genuinely missing include is still reported, just
+	 * a minute and a half later.
+	 */
+	time_t next_canary = time(NULL) + (time_t)
+	        (cfg.canary_interval && cfg.canary_interval < CANARY_SETTLE_SECS
+	                 ? cfg.canary_interval
+	                 : CANARY_SETTLE_SECS);
 	enum canary_result last_canary = CANARY_INCONCLUSIVE;
 	struct classify_ctx cls;
 	struct nfr_conn dnfr;
@@ -1394,7 +1436,7 @@ int main(int argc, char **argv)
 				 * stream of passes is what makes silence mean
 				 * something.
 				 */
-				canary_report(cfg.sense_spool, cfg.serial, cr,
+				canary_report(cfg.canary_spool, cfg.serial, cr,
 				              target.set_v4, false);
 
 				last_canary = cr;
