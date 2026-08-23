@@ -514,6 +514,7 @@ struct classify_ctx {
 	uint64_t pushed[AFPUSH_MAX_MSG / 16];
 	size_t n_pushed;
 	uint64_t push_failed;
+	unsigned allowed_logged;
 };
 
 /*
@@ -618,6 +619,8 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 	 * and appblock_decide refuses -- applying some other device's rules to
 	 * an unattributable flow would block the wrong household member.
 	 */
+	uint8_t subj_mac[NEIGH_MAC_LEN] = { 0 };
+	bool have_subj = false;
 	{
 		uint8_t mac[NEIGH_MAC_LEN];
 		const uint8_t *subject = NULL;
@@ -692,6 +695,10 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 			       f.have_host ? f.host : "-",
 			       (unsigned long long)ns.hits + ns.miss_not_found);
 		}
+		if (subject) {
+			memcpy(subj_mac, subject, NEIGH_MAC_LEN);
+			have_subj = true;
+		}
 		d = appblock_decide(&f, cc->sigs, cc->pol, subject, pt, 0,
 		                    cc->addr_timeout);
 	}
@@ -699,6 +706,37 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 	if (d.reason < (enum appblock_reason)(sizeof(cc->skipped) /
 	                                      sizeof(cc->skipped[0])))
 		cc->skipped[d.reason]++;
+
+	/* Name the app and subject on the ALLOWED path. "policy permitted it"
+	 * is the one refusal that looks identical whether the rule genuinely
+	 * does not apply or the tag/subject comparison is wrong. */
+	if (d.reason == ABR_NO_SUBJECT && cc->allowed_logged < 6) {
+		const uint8_t *pm = (cc->pol && cc->pol->n_subjects)
+		                            ? cc->pol->subjects[0].mac
+		                            : NULL;
+
+		cc->allowed_logged++;
+		syslog(LOG_WARNING,
+		       "SUBJECT MISMATCH host=%s tag=%s "
+		       "resolved=%02x:%02x:%02x:%02x:%02x:%02x "
+		       "policy[0]=%02x:%02x:%02x:%02x:%02x:%02x n_subjects=%zu",
+		       f.have_host ? f.host : "-", d.app_tag[0] ? d.app_tag : "-",
+		       subj_mac[0], subj_mac[1], subj_mac[2], subj_mac[3],
+		       subj_mac[4], subj_mac[5],
+		       pm ? pm[0] : 0, pm ? pm[1] : 0, pm ? pm[2] : 0,
+		       pm ? pm[3] : 0, pm ? pm[4] : 0, pm ? pm[5] : 0,
+		       cc->pol ? cc->pol->n_subjects : 0);
+	}
+	if (d.reason == ABR_ALLOWED && cc->allowed_logged < 8) {
+		const uint8_t *sm = subj_mac;
+
+		(void)have_subj;
+		cc->allowed_logged++;
+		syslog(LOG_INFO,
+		       "app-block ALLOWED: host=%s tag=%s subject=%02x:%02x:%02x:%02x:%02x:%02x",
+		       f.have_host ? f.host : "-", d.app_tag[0] ? d.app_tag : "-",
+		       sm[0], sm[1], sm[2], sm[3], sm[4], sm[5]);
+	}
 
 	switch (d.action) {
 	case ACT_ADDR: {
@@ -1039,7 +1077,11 @@ int main(int argc, char **argv)
 			afpush_close(&afc);
 		}
 	}
-	pol_db_free(&pol);
+	/* NOT freed here. cls.pol points at this database for the whole life of
+	 * the daemon; freeing it before the poll loop left classification
+	 * evaluating an empty policy -- n_subjects=0 -- so every flow reported
+	 * "not attributable to a device" while startup had logged the subjects
+	 * loading correctly. Freed after the loop instead. */
 
 	struct nft_target target = { "inet", "fw4", "aether_rep4", "aether_rep6" };
 
@@ -1422,6 +1464,16 @@ int main(int argc, char **argv)
 		       (unsigned long long)ds.with_host,
 		       (unsigned long long)cls.enforced_addr,
 		       (unsigned long long)cls.apply_failed);
+		syslog(LOG_INFO,
+		       "app-block reasons: enforced=%llu no_host=%llu "
+		       "unknown_app=%llu no_subject=%llu allowed=%llu "
+		       "ambiguous=%llu",
+		       (unsigned long long)cls.skipped[ABR_ENFORCED],
+		       (unsigned long long)cls.skipped[ABR_NO_HOST],
+		       (unsigned long long)cls.skipped[ABR_UNKNOWN_APP],
+		       (unsigned long long)cls.skipped[ABR_NO_SUBJECT],
+		       (unsigned long long)cls.skipped[ABR_ALLOWED],
+		       (unsigned long long)cls.skipped[ABR_AMBIGUOUS]);
 		if (cls.skipped[ABR_NO_SUBJECT])
 			syslog(LOG_WARNING,
 			       "classification: %llu flows identified but NOT "
@@ -1498,6 +1550,7 @@ int main(int argc, char **argv)
 	       (unsigned long long)ap.failed_batches,
 	       (unsigned long long)ap.verify_mismatches);
 
+	pol_db_free(&pol);
 	sig_db_free(&sigs);
 	closelog();
 	return 0;

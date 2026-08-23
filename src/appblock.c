@@ -107,7 +107,15 @@ struct appblock_decision appblock_decide(const struct dpi_result *flow,
 
 	v = pol_evaluate(pol, subject_mac, d.app_tag, NULL, now, used_today_sec);
 	if (v.action != POL_BLOCK) {
-		d.reason = ABR_ALLOWED;
+		/*
+		 * pol_evaluate returns ALLOW for BOTH "a rule permits this" and
+		 * "this device is not under policy at all". Reporting them the
+		 * same way hid a whole class of failure on the BPI-R4: every
+		 * flow read as ABR_ALLOWED while no_subject stayed at zero, so
+		 * an unmatched subject looked like a deliberate permit.
+		 */
+		d.reason = (v.reason == POL_REASON_NO_SUBJECT) ? ABR_NO_SUBJECT
+		                                               : ABR_ALLOWED;
 		return d;
 	}
 
