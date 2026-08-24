@@ -774,7 +774,8 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 	 * packet path.
 	 */
 	if (cc->flows)
-		flowlog_record(cc->flows, &f, &d);
+		flowlog_record(cc->flows, &f, &d,
+		               have_subj ? subj_mac : NULL);
 
 	/* Name the app and subject on the ALLOWED path. "policy permitted it"
 	 * is the one refusal that looks identical whether the rule genuinely

@@ -50,9 +50,11 @@ static void flowlog_prune(const char *dir)
 }
 
 void flowlog_record(struct flowlog *fl, const struct dpi_result *f,
-                    const struct appblock_decision *d)
+                    const struct appblock_decision *d,
+                    const uint8_t *subject_mac)
 {
 	char dst[64] = "?";
+	char mac[24];
 	const char *scope;
 	const char *action;
 
@@ -68,6 +70,15 @@ void flowlog_record(struct flowlog *fl, const struct dpi_result *f,
 	}
 
 	obs_addr_str(&f->dst, dst, sizeof(dst));
+	/* An unattributable flow carries no MAC rather than a zeroed one:
+	 * 00:00:00:00:00:00 is a plausible-looking value that would attribute
+	 * every unattributed flow on the network to one fictional client. */
+	if (subject_mac)
+		snprintf(mac, sizeof(mac), "\"%02x:%02x:%02x:%02x:%02x:%02x\"",
+		         subject_mac[0], subject_mac[1], subject_mac[2],
+		         subject_mac[3], subject_mac[4], subject_mac[5]);
+	else
+		snprintf(mac, sizeof(mac), "null");
 	scope = f->scope == DPI_SCOPE_ADDRESS ? "address" : "name_hash";
 	switch (d->action) {
 	case ACT_ADDR: action = "blocked_address"; break;
@@ -82,7 +93,8 @@ void flowlog_record(struct flowlog *fl, const struct dpi_result *f,
 	 * hostname cut mid-label is a different hostname. */
 	snprintf(fl->pending[fl->n_pending], sizeof(fl->pending[0]),
 	         "{\"proto\":\"%.64s\",\"l4\":\"%.8s\",\"dport\":%u,\"dst\":\"%.64s\","
-	         "\"host\":%s%.256s%s,\"app\":%s%.64s%s,\"scope\":\"%.16s\","
+	         "\"hostname\":%s%.256s%s,\"app\":%s%.64s%s,\"scope\":\"%.16s\","
+	         "\"client_mac\":%.24s,"
 	         "\"action\":\"%.24s\",\"reason\":\"%.24s\",\"at\":%lld}\n",
 	         f->proto_name[0] ? f->proto_name : "unknown",
 	         f->l4proto == 6 ? "tcp" : (f->l4proto == 17 ? "udp" : "other"),
@@ -94,7 +106,7 @@ void flowlog_record(struct flowlog *fl, const struct dpi_result *f,
 	         f->have_host && f->host[0] ? "\"" : "",
 	         d->app_tag[0] ? "\"" : "", d->app_tag[0] ? d->app_tag : "null",
 	         d->app_tag[0] ? "\"" : "",
-	         scope, action, appblock_reason_wire(d->reason),
+	         scope, mac, action, appblock_reason_wire(d->reason),
 	         (long long)time(NULL));
 
 	fl->n_pending++;

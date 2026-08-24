@@ -100,6 +100,7 @@ static void test_record_is_shaped_for_a_consumer(void)
 	struct flowlog fl;
 	struct dpi_result f;
 	struct appblock_decision d;
+	static const uint8_t mac[6] = { 0xa0, 0xd7, 0xf3, 0x11, 0x22, 0x33 };
 	char *out;
 
 	if (!mkdtemp(dir)) {
@@ -110,11 +111,15 @@ static void test_record_is_shaped_for_a_consumer(void)
 
 	f = mkflow("www.youtube.com", "TLS");
 	d = mkdec("youtube", ABR_ENFORCED, ACT_HASH);
-	flowlog_record(&fl, &f, &d);
+	flowlog_record(&fl, &f, &d, mac);
 	flowlog_flush(&fl);
 
 	out = slurp(dir);
-	CHECK(strstr(out, "\"host\":\"www.youtube.com\"") != NULL, "carries the name");
+	CHECK(strstr(out, "\"hostname\":\"www.youtube.com\"") != NULL, "carries the name");
+	/* The rollup is keyed per (client, app). A record without a client is
+	 * rejected as MissingClient -- 520 were, before this was noticed. */
+	CHECK(strstr(out, "\"client_mac\":\"a0:d7:f3:11:22:33\"") != NULL,
+	      "carries the subject so the flow can be attributed");
 	CHECK(strstr(out, "\"app\":\"youtube\"") != NULL, "carries the app tag");
 	CHECK(strstr(out, "\"action\":\"blocked_name\"") != NULL, "carries the decision");
 	CHECK(strstr(out, "\"reason\":\"enforced\"") != NULL, "carries the wire reason");
@@ -143,12 +148,17 @@ static void test_an_unrecovered_name_is_null_not_empty(void)
 	 * failures and the consumer must be able to tell them apart. */
 	f = mkflow(NULL, "QUIC");
 	d = mkdec(NULL, ABR_NO_HOST, ACT_NONE);
-	flowlog_record(&fl, &f, &d);
+	flowlog_record(&fl, &f, &d, NULL);
 	flowlog_flush(&fl);
 
 	out = slurp(dir);
-	CHECK(strstr(out, "\"host\":null") != NULL, "absent name is null");
-	CHECK(strstr(out, "\"host\":\"\"") == NULL, "never an empty string");
+	CHECK(strstr(out, "\"hostname\":null") != NULL, "absent name is null");
+	CHECK(strstr(out, "\"hostname\":\"\"") == NULL, "never an empty string");
+	/* Unattributable: null, never 00:00:00:00:00:00 -- a zeroed MAC is a
+	 * plausible value that would attribute every unattributed flow on the
+	 * network to one fictional client. */
+	CHECK(strstr(out, "\"client_mac\":null") != NULL, "no subject is null");
+	CHECK(strstr(out, "00:00:00:00:00:00") == NULL, "never a zeroed MAC");
 	CHECK(strstr(out, "\"app\":null") != NULL, "absent app is null");
 	CHECK(strstr(out, "\"reason\":\"no_host\"") != NULL, "reason survives");
 }
@@ -159,6 +169,7 @@ static void test_the_batch_reports_its_own_losses(void)
 	struct flowlog fl;
 	struct dpi_result f;
 	struct appblock_decision d;
+	static const uint8_t mac[6] = { 0xa0, 0xd7, 0xf3, 0x11, 0x22, 0x33 };
 	char *out;
 	int i;
 
@@ -173,7 +184,7 @@ static void test_the_batch_reports_its_own_losses(void)
 	/* One past a full batch: the flush at capacity empties the buffer, so
 	 * this exercises the boundary rather than the drop path. */
 	for (i = 0; i < FLOWLOG_BATCH_ROWS + 1; i++)
-		flowlog_record(&fl, &f, &d);
+		flowlog_record(&fl, &f, &d, mac);
 	flowlog_flush(&fl);
 
 	out = slurp(dir);
@@ -189,11 +200,13 @@ static void test_nothing_is_written_without_a_spool(void)
 	struct dpi_result f = mkflow("example.com", "TLS");
 	struct appblock_decision d = mkdec("web", ABR_ALLOWED, ACT_NONE);
 
+	static const uint8_t mac[6] = { 1, 2, 3, 4, 5, 6 };
+
 	memset(&fl, 0, sizeof(fl));
 	/* Classification is separately consented. A device that has not opted
 	 * in never gets a spool, and recording must be a silent no-op rather
 	 * than an error per packet. */
-	flowlog_record(&fl, &f, &d);
+	flowlog_record(&fl, &f, &d, mac);
 	flowlog_flush(&fl);
 	CHECK(fl.written == 0, "no spool, nothing written");
 	CHECK(fl.n_pending == 0, "and nothing buffered");

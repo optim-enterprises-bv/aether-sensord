@@ -21,12 +21,16 @@
  * produces no spool at all.
  *
  * WHAT IS AND IS NOT RECORDED. The destination, the recovered server name, the
- * protocol, the matched application and the enforcement decision. NOT the
- * payload, not the subject's MAC in the clear -- the subject is a device on the
- * subscriber's own LAN, and shipping a per-flow MAC would send the household's
- * internal topology to the controller for every connection. The controller
- * already learns which devices exist through argus; it does not need them
- * re-stated per flow.
+ * protocol, the matched application, the enforcement decision, and the subject
+ * MAC. NOT the payload.
+ *
+ * The subject MAC was omitted in the first version of this file, on the
+ * reasoning that a per-flow MAC ships the household's internal topology. That
+ * was wrong twice over: the controller ALREADY holds every client MAC in
+ * `client_fingerprints` via argus, so withholding it protected nothing; and the
+ * rollup is keyed per (client, app), so a record without one cannot be
+ * attributed at all. 520 records were rejected as `MissingClient` before this
+ * was noticed.
  */
 
 #ifndef AETHER_SENSORD_FLOWLOG_H
@@ -84,7 +88,8 @@ bool flowlog_init(struct flowlog *fl, const char *spool_dir);
  * the packet path.
  */
 void flowlog_record(struct flowlog *fl, const struct dpi_result *f,
-                    const struct appblock_decision *d);
+                    const struct appblock_decision *d,
+                    const uint8_t *subject_mac);
 
 /* Write whatever is buffered, if anything. Called on the daemon interval so a
  * quiet link still reports before its rows go stale. */
