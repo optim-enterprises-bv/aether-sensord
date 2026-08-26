@@ -65,6 +65,15 @@
  */
 #define DPI_MAX_PKTS_PER_FLOW 32
 
+/* Answers carried per DNS reply.
+ *
+ * nDPI stores up to MAX_NUM_DNS_RSP_ADDRESSES; this takes the first few. A
+ * CDN name resolving to a dozen addresses does not need all of them recorded
+ * to attribute a flow -- the client connects to one, and any of the first few
+ * is as likely as the rest. Bounded because every one of these widens the
+ * flow row, and a row that cannot be shown to fit is a row that truncates. */
+#define DPI_MAX_ANSWERS 4
+
 enum dpi_verdict_scope {
 	/* Kernel can re-derive this name from the wire: push a hash. */
 	DPI_SCOPE_NAME_HASH = 0,
@@ -87,6 +96,30 @@ struct dpi_result {
 
 	/* Where a block for this flow has to be applied. See the header note. */
 	enum dpi_verdict_scope scope;
+
+	/*
+	 * DNS answers, when this flow is a DNS reply.
+	 *
+	 * WHY. nDPI recovers a QUIC SNI only when the ClientHello fits in one
+	 * Initial packet, and Chrome's no longer does -- its post-quantum key
+	 * share splits the ClientHello across two or three Initials and nDPI
+	 * does not reassemble QUIC CRYPTO frames. Measured on a capture from
+	 * the BPI-R4: Wireshark recovered 6 names, nDPI 5.0.0 recovered 1, and
+	 * nDPI dev (with the Wireshark-derived QUIC refactor) also 1. Every
+	 * QUIC flow therefore reaches the controller unnamed.
+	 *
+	 * The addresses were resolved by this same household moments earlier
+	 * and nDPI has always parsed the answers -- nothing read them. The
+	 * flow's `dst` for a DNS reply is the RESOLVER, so the controller
+	 * learned which name was asked for and never what it resolved to.
+	 * These fields carry the missing half.
+	 *
+	 * NOT a lookup. This is an answer the device already forwarded to the
+	 * client that asked for it.
+	 */
+	struct obs_addr answers[DPI_MAX_ANSWERS];
+	uint32_t answer_ttl[DPI_MAX_ANSWERS];
+	uint8_t n_answers;
 };
 
 /* Counters. Every one of these is a way dissection can fail to happen, and a

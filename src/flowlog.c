@@ -114,6 +114,59 @@ void flowlog_record(struct flowlog *fl, const struct dpi_result *f,
 		flowlog_flush(fl);
 }
 
+void flowlog_record_dns(struct flowlog *fl, const struct dpi_result *f)
+{
+	char ips[4 * 48];
+	size_t off = 0;
+	uint8_t i;
+	int n;
+
+	if (!fl || !fl->spool[0] || !f)
+		return;
+	if (!f->have_host || !f->host[0] || f->n_answers == 0)
+		return;
+
+	if (fl->n_pending >= FLOWLOG_BATCH_ROWS)
+		flowlog_flush(fl);
+	if (fl->n_pending >= FLOWLOG_BATCH_ROWS) {
+		/* Flush failed; the flow rows are kept and retried, so this one
+		 * is dropped rather than growing the buffer past its bound. It
+		 * is counted, because a mapping that silently vanishes shows up
+		 * later as a flow the controller could not name and no reason
+		 * why. */
+		fl->dropped++;
+		return;
+	}
+
+	ips[0] = '\0';
+	for (i = 0; i < f->n_answers && off < sizeof(ips); i++) {
+		char one[46];
+
+		if (!obs_addr_str(&f->answers[i], one, sizeof(one)))
+			continue;
+		n = snprintf(ips + off, sizeof(ips) - off, "%s\"%.45s\"",
+		             off ? "," : "", one);
+		if (n < 0 || (size_t)n >= sizeof(ips) - off)
+			break;
+		off += (size_t)n;
+	}
+	if (off == 0)
+		return;
+
+	/* The TTL of the FIRST answer. They are the same record set and in
+	 * practice share a TTL; carrying one keeps the row a fixed shape, and
+	 * the controller uses it only to decide how long the mapping may be
+	 * trusted. */
+	snprintf(fl->pending[fl->n_pending], sizeof(fl->pending[0]),
+	         "{\"dns_map\":true,\"hostname\":\"%.256s\",\"ips\":[%.200s],"
+	         "\"ttl\":%u,\"at\":%lld}\n",
+	         f->host, ips, f->answer_ttl[0], (long long)time(NULL));
+
+	fl->n_pending++;
+	if (fl->n_pending >= FLOWLOG_BATCH_ROWS)
+		flowlog_flush(fl);
+}
+
 void flowlog_flush(struct flowlog *fl)
 {
 	char path[512], tmp[540];

@@ -357,6 +357,13 @@ size_t dpi_expire(struct dpi_ctx *c, uint64_t now_ms, uint64_t idle_ms)
 
 /* Which protocols actually populate protos.tls_quic. Shared with DTLS and the
  * S-suffixed mail protocols, per the nDPI header comment on that member. */
+/* protos.dns is only live for DNS flows -- protos is a union. */
+static bool is_dns(ndpi_protocol pr)
+{
+	return pr.proto.master_protocol == NDPI_PROTOCOL_DNS ||
+	       pr.proto.app_protocol == NDPI_PROTOCOL_DNS;
+}
+
 static bool is_tls_family(ndpi_protocol pr)
 {
 	uint16_t p[2] = { pr.proto.master_protocol, pr.proto.app_protocol };
@@ -423,6 +430,57 @@ static void take_host(struct dpi_ctx *c, struct dpi_flow *f,
 	memcpy(out->host, h, n);
 	out->host[n] = '\0';
 	out->have_host = true;
+}
+
+/*
+ * Copy the A/AAAA answers out of a DNS reply.
+ *
+ * `protos` is a UNION, exactly as take_host() warns. Reading protos.dns on a
+ * flow that is not DNS returns whichever member is actually live, reinterpreted
+ * as DNS state -- which here would mean a random byte as num_rsp_addr and
+ * random bytes copied out as addresses. So the protocol is checked first and
+ * the count is clamped rather than trusted.
+ */
+static void take_dns_answers(struct dpi_flow *f, struct dpi_result *out,
+                             ndpi_protocol pr)
+{
+	uint8_t i, n;
+
+	out->n_answers = 0;
+	if (!f->nf)
+		return;
+	if (!is_dns(pr))
+		return;
+
+	n = f->nf->protos.dns.num_rsp_addr;
+	if (n > DPI_MAX_ANSWERS)
+		n = DPI_MAX_ANSWERS;
+
+	for (i = 0; i < n; i++) {
+		bool ok;
+
+		if (f->nf->protos.dns.is_rsp_addr_ipv6[i])
+			ok = obs_addr_from_v6(&out->answers[out->n_answers],
+			                      (const uint8_t *)&f->nf->protos.dns.rsp_addr[i]);
+		else
+			ok = obs_addr_from_v4(&out->answers[out->n_answers],
+			                      (const uint8_t *)&f->nf->protos.dns.rsp_addr[i]);
+		if (!ok)
+			continue;
+
+		/*
+		 * A private answer is not reported, for the same reason
+		 * obs_addr_is_private() exists at all: a router that ships the
+		 * subscriber's own RFC1918 mappings to the cloud is a privacy
+		 * failure, and split-horizon DNS makes those routine.
+		 */
+		if (obs_addr_is_private(&out->answers[out->n_answers]))
+			continue;
+
+		out->answer_ttl[out->n_answers] =
+		        f->nf->protos.dns.rsp_addr_ttl[i];
+		out->n_answers++;
+	}
 }
 
 bool dpi_process(struct dpi_ctx *c, const uint8_t *pkt, uint32_t len,
@@ -499,6 +557,30 @@ bool dpi_process(struct dpi_ctx *c, const uint8_t *pkt, uint32_t len,
 	    f->pkts < DPI_MAX_PKTS_PER_FLOW)
 		return false; /* undecided on the NAME; keep dissecting */
 
+	/*
+	 * DNS is decided on the QUERY and answered on the REPLY.
+	 *
+	 * host_server_name is filled from the query name on the very first
+	 * packet, so the test above is already false by then: the flow is
+	 * reported, f->done is set, and the early return at the top of this
+	 * function means the reply is never handed to nDPI at all. Answers
+	 * therefore stayed permanently empty -- the extraction was right and
+	 * ran before there was anything to extract. Zero dns_map rows on the
+	 * device is what that looks like.
+	 *
+	 * So a DNS flow waits for its reply. The reply is packet 2 in the
+	 * ordinary case and the same per-flow budget still bounds it.
+	 *
+	 * COST, stated rather than discovered later: a query that is never
+	 * answered now produces no flow record, where before it produced one
+	 * naming the query. That is the honest outcome -- nothing was
+	 * resolved -- but it is a change, and it is why this waits on the
+	 * answer count rather than on the reply packet.
+	 */
+	if (is_dns(pr) && f->nf->protos.dns.num_rsp_addr == 0 &&
+	    f->pkts < DPI_MAX_PKTS_PER_FLOW)
+		return false; /* named, but not yet resolved; keep dissecting */
+
 	f->done = true;
 	if (f->reported)
 		return false;
@@ -518,6 +600,7 @@ bool dpi_process(struct dpi_ctx *c, const uint8_t *pkt, uint32_t len,
 	out->l4proto = l4;
 
 	take_host(c, f, out, pr);
+	take_dns_answers(f, out, pr);
 
 	out->scope = dpi_kernel_can_match(l4, out->master_proto, out->app_proto)
 	                     ? DPI_SCOPE_NAME_HASH

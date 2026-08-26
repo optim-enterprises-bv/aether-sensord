@@ -93,6 +93,22 @@ void flowlog_record(struct flowlog *fl, const struct dpi_result *f,
 
 /* Write whatever is buffered, if anything. Called on the daemon interval so a
  * quiet link still reports before its rows go stale. */
+/*
+ * Record what a DNS reply resolved to.
+ *
+ * A THIRD row shape in this stream, alongside flow rows and the trailing
+ * `meta` row: {"dns_map":true,"hostname":...,"ips":[...],"ttl":N,"at":...}
+ *
+ * Separate from the flow row rather than a field on it, because only DNS
+ * flows have answers and widening every row for a field almost all of them
+ * leave empty costs spool on flash for nothing.
+ *
+ * No-op when the flow is not a DNS reply, carries no name, or resolved to
+ * nothing reportable -- NXDOMAIN and CNAME-only replies are ordinary and a
+ * mapping to no address is not worth a row.
+ */
+void flowlog_record_dns(struct flowlog *fl, const struct dpi_result *f);
+
 void flowlog_flush(struct flowlog *fl);
 
 #endif /* AETHER_SENSORD_FLOWLOG_H */

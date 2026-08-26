@@ -773,9 +773,18 @@ static void on_classify_packet(const uint8_t *pkt, uint32_t len, void *user)
 	 * buffers and writes in batches, so nothing here touches flash in the
 	 * packet path.
 	 */
-	if (cc->flows)
+	if (cc->flows) {
 		flowlog_record(cc->flows, &f, &d,
 		               have_subj ? subj_mac : NULL);
+		/*
+		 * And, when this flow was a DNS reply, what it resolved to.
+		 * Unconditional alongside the flow record rather than gated on
+		 * policy: the mapping is what lets the controller name QUIC
+		 * flows nDPI cannot, and those are the flows policy most needs
+		 * to see. No-ops for everything that is not a DNS answer.
+		 */
+		flowlog_record_dns(cc->flows, &f);
+	}
 
 	/* Name the app and subject on the ALLOWED path. "policy permitted it"
 	 * is the one refusal that looks identical whether the rule genuinely
