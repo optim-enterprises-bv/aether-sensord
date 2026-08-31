@@ -20,6 +20,7 @@ const char *appblock_reason_str(enum appblock_reason r)
 	case ABR_NO_SUBJECT:   return "flow not attributable to a device";
 	case ABR_ALLOWED:      return "allowed by policy";
 	case ABR_AMBIGUOUS:    return "hostname claimed by several applications";
+	case ABR_DNS_PEER:     return "named by a DNS query; the peer is the resolver, not the application";
 	default:               return "?";
 	}
 }
@@ -57,6 +58,7 @@ const char *appblock_reason_wire(enum appblock_reason r)
 	case ABR_NO_SUBJECT:  return "no_subject";
 	case ABR_ALLOWED:     return "allowed";
 	case ABR_AMBIGUOUS:   return "ambiguous";
+	case ABR_DNS_PEER:    return "dns_peer";
 	default:              return "unknown";
 	}
 }
@@ -148,6 +150,25 @@ struct appblock_decision appblock_decide(const struct dpi_result *flow,
 		d.reason = ABR_ALLOWED;
 		return d;
 	}
+	/*
+	 * Never address-block a DNS transaction.
+	 *
+	 * A DNS query for a blocked application is correctly named after that
+	 * application, but the peer of that flow is the RESOLVER. Blocking it
+	 * does not block the app -- it removes name resolution for everything.
+	 *
+	 * The addresses worth blocking are the ones the reply carries, and they
+	 * reach the set through the resolved-address path, not this one.
+	 */
+	if (flow->l4proto == 17 || flow->l4proto == 6) {
+		if (flow->sport == 53 || flow->dport == 53 ||
+		    flow->sport == 5353 || flow->dport == 5353 ||
+		    flow->sport == 853 || flow->dport == 853) {
+			d.reason = ABR_DNS_PEER;
+			return d;
+		}
+	}
+
 	if (!pick_peer(flow, &peer)) {
 		d.reason = ABR_NO_SUBJECT;
 		return d;

@@ -327,11 +327,78 @@ static void test_ipv6_peer(void)
 	sig_db_free(&s);
 }
 
+
+/*
+ * A DNS query naming a blocked application must never be address-blocked.
+ *
+ * The flow is correctly named -- it is a lookup FOR that application -- but its
+ * peer is the resolver. Blocking it removes name resolution for every device
+ * on the LAN rather than blocking the app.
+ *
+ * Measured on a BPI-R4 before the guard existed: one parental rule for a single
+ * device put 1.1.1.1 and 1.0.0.1 into the drop set, and the whole network lost
+ * DNS while the counters reported the rule enforced.
+ */
+static void test_dns_peer_is_never_address_blocked(void)
+{
+	struct sig_db s;
+	struct pol_db p;
+	struct dpi_result f;
+	struct appblock_decision d;
+	const uint16_t dns_ports[] = { 53, 5353, 853 };
+	size_t i;
+
+	db_init(&s);
+	pol_init_block(&p, &s, "youtube");
+
+	for (i = 0; i < sizeof(dns_ports) / sizeof(dns_ports[0]); i++) {
+		/* Query direction: the resolver is the destination. */
+		f = mkflow("youtube.example", IPPROTO_UDP, DPI_SCOPE_ADDRESS,
+		           "192.168.1.151", "1.1.1.1");
+		f.dport = dns_ports[i];
+		d = appblock_decide(&f, &s, &p, MAC, NOW, 0, 900);
+		CHECK(d.action != ACT_ADDR,
+		      "a DNS query is not address-blocked");
+		CHECK(d.reason == ABR_DNS_PEER,
+		      "and the reason says why, rather than reading as allowed");
+
+		/* Reply direction: the resolver is the source. */
+		f = mkflow("youtube.example", IPPROTO_UDP, DPI_SCOPE_ADDRESS,
+		           "192.168.1.151", "1.1.1.1");
+		f.sport = dns_ports[i];
+		f.dport = 40000;
+		d = appblock_decide(&f, &s, &p, MAC, NOW, 0, 900);
+		CHECK(d.action != ACT_ADDR,
+		      "nor is the reply direction");
+	}
+
+	/* TCP/853 (DoT) is DNS too, and over TCP. */
+	f = mkflow("youtube.example", IPPROTO_TCP, DPI_SCOPE_ADDRESS,
+	           "192.168.1.151", "1.1.1.1");
+	f.dport = 853;
+	d = appblock_decide(&f, &s, &p, MAC, NOW, 0, 900);
+	CHECK(d.action != ACT_ADDR, "DNS-over-TLS is not address-blocked");
+
+	/* The guard must not swallow ordinary traffic: same app, real port. */
+	f = mkflow("youtube.example", IPPROTO_TCP, DPI_SCOPE_ADDRESS,
+	           "192.168.1.151", "203.0.113.9");
+	f.dport = 443;
+	d = appblock_decide(&f, &s, &p, MAC, NOW, 0, 900);
+	CHECK(d.action == ACT_ADDR,
+	      "a real application flow is still enforced");
+
+	pol_db_free(&p);
+	sig_db_free(&s);
+}
+
 static void test_reason_strings(void)
 {
 	CHECK(strlen(appblock_reason_str(ABR_ENFORCED)) > 0, "enforced");
 	CHECK(strlen(appblock_reason_str(ABR_NO_HOST)) > 0, "no host");
 	CHECK(strlen(appblock_reason_str(ABR_AMBIGUOUS)) > 0, "ambiguous");
+	CHECK(strlen(appblock_reason_str(ABR_DNS_PEER)) > 0, "dns peer");
+	CHECK(strcmp(appblock_reason_wire(ABR_DNS_PEER), "dns_peer") == 0,
+	      "dns_peer has a stable wire name");
 	CHECK(strcmp(appblock_reason_str((enum appblock_reason)99), "?") == 0,
 	      "an unknown reason does not read as a real one");
 }
@@ -345,6 +412,7 @@ int main(void)
 	test_allowed_is_not_a_failure();
 	test_ambiguous_host_is_refused();
 	test_ipv6_peer();
+	test_dns_peer_is_never_address_blocked();
 	test_reason_strings();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

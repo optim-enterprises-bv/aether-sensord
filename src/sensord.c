@@ -1698,13 +1698,21 @@ int main(int argc, char **argv)
 		syslog(LOG_INFO,
 		       "app-block reasons: enforced=%llu no_host=%llu "
 		       "unknown_app=%llu no_subject=%llu allowed=%llu "
-		       "ambiguous=%llu",
+		       "ambiguous=%llu dns_peer=%llu",
 		       (unsigned long long)cls.skipped[ABR_ENFORCED],
 		       (unsigned long long)cls.skipped[ABR_NO_HOST],
 		       (unsigned long long)cls.skipped[ABR_UNKNOWN_APP],
 		       (unsigned long long)cls.skipped[ABR_NO_SUBJECT],
 		       (unsigned long long)cls.skipped[ABR_ALLOWED],
-		       (unsigned long long)cls.skipped[ABR_AMBIGUOUS]);
+		       (unsigned long long)cls.skipped[ABR_AMBIGUOUS],
+		       (unsigned long long)cls.skipped[ABR_DNS_PEER]);
+		if (cls.skipped[ABR_DNS_PEER])
+			syslog(LOG_INFO,
+			       "app-block: %llu flows named an application from a "
+			       "DNS query and were NOT address-blocked; blocking "
+			       "the resolver would remove name resolution rather "
+			       "than the application",
+			       (unsigned long long)cls.skipped[ABR_DNS_PEER]);
 		if (cls.skipped[ABR_NO_SUBJECT])
 			syslog(LOG_WARNING,
 			       "classification: %llu flows identified but NOT "

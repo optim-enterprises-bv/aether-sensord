@@ -59,7 +59,15 @@ enum appblock_reason {
 	ABR_UNKNOWN_APP,    /* hostname matches no signature */
 	ABR_NO_SUBJECT,     /* could not attribute the flow to a known device */
 	ABR_ALLOWED,        /* policy says allow */
-	ABR_AMBIGUOUS       /* hostname claimed by several apps; see below */
+	ABR_AMBIGUOUS,      /* hostname claimed by several apps; see below */
+	/*
+	 * The flow naming the app is a DNS transaction, so its peer is the
+	 * RESOLVER and blocking it would remove name resolution rather than
+	 * the application. Measured on a BPI-R4: one parental rule put
+	 * 1.1.1.1 and 1.0.0.1 into the drop set and every device on the LAN
+	 * lost DNS, while the counters reported the rule enforced.
+	 */
+	ABR_DNS_PEER
 };
 
 struct appblock_decision {
