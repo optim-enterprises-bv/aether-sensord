@@ -1327,7 +1327,36 @@ int main(int argc, char **argv)
 				       "classified flows will NOT be reported: "
 				       "cannot use %s", cfg.dpi_spool);
 			if (afpush_open(&cls.afc)) {
+				long seeded;
+
 				cls.af_live = 1;
+
+				/*
+				 * Seed from the policy before resetting.
+				 *
+				 * `cls.pushed` is otherwise filled only in the
+				 * live flow path, one hash at a time as traffic
+				 * is observed, so at startup it is empty. The
+				 * reset below then installs THAT -- an empty
+				 * set -- and calls it "matching the loaded
+				 * policy", overwriting the ruleset the compile
+				 * at daemon start had already pushed.
+				 *
+				 * Measured on a BPI-R4: `pushed 1/1 app rule
+				 * hashes`, `committed 1 rules`, and one second
+				 * later `module rules reset to match the loaded
+				 * policy (0 hashes)`, `committed 0 rules`. Two
+				 * paths held two ideas of the ruleset and the
+				 * empty one ran last, so a correct policy
+				 * enforced nothing while every log line read
+				 * like success.
+				 */
+				seeded = afpush_compile(&pol, &sigs, cls.pushed,
+				                        sizeof(cls.pushed) /
+				                            sizeof(cls.pushed[0]),
+				                        NULL);
+				cls.n_pushed = seeded > 0 ? (size_t)seeded : 0;
+
 				/* Start from a known state. Without this the
 				 * module keeps whatever the previous run left
 				 * behind, so removing a rule from the policy
