@@ -40,7 +40,7 @@ Do NOT load reputation rules into a pf anchor. OPNsense regenerates its ruleset
 from config.xml on every filter reload, so an anchor's rules exist, print
 correctly under `pfctl -a <name> -s rules`, and are never evaluated.
 
-Register the table as an OPNsense static alias of type `external` instead:
+Register the table as an OPNsense static alias of type `external`:
 
     /usr/local/opnsense/mvc/app/models/OPNsense/Firewall/static_aliases/core.json
 
@@ -55,10 +55,28 @@ Register the table as an OPNsense static alias of type `external` instead:
       }
     }
 
-OPNsense then generates the rule referencing it. Precedent: `sshlockout` is
-referenced 4 times in the generated ruleset and `virusprot` 3 times. `expire`
-gives kernel-side decay, so a feed that stops refreshing stops blocking instead
-of leaving a stale table enforcing forever.
+`expire` gives kernel-side decay, so a feed that stops refreshing stops blocking
+instead of leaving a stale table enforcing forever.
+
+REGISTERING THE ALIAS DOES NOT CREATE THE RULE -- YOU MUST ADD ONE
+------------------------------------------------------------------
+Measured on 26.7.2_2: after registering `aisense_rep4` and reloading the filter,
+the table exists in pf, and `pfctl -s rules | grep -c aisense_rep4` returns 0.
+OPNsense does NOT generate a rule for a static alias. The precedent that
+suggested otherwise is misleading: `sshlockout` and `virusprot` are referenced
+in the generated ruleset because they are built-in DEFAULT firewall rules, not
+because the registry entry produced them.
+
+So a rule referencing the alias must be added, once, in the GUI or the config:
+Firewall > Rules, "block", source = `aisense_rep4` (the alias appears as a
+selectable source), destination = any. Without it the table is populated and
+NOTHING IS EVER DROPPED -- the exact silent non-enforcement this port exists to
+make impossible, and the state the canary reports as `not_enforced`.
+
+Verify the rule landed before trusting anything:
+
+    pfctl -s rules | grep aisense_rep4          # must be non-empty
+    aether-sensord-pfcanary aisense_rep4       # exit 0 only when `enforced`
 
 Populate it out of band:
 
