@@ -6,6 +6,15 @@
 
 #include "observe.h"
 
+/*
+ * `<sys/socket.h>` BEFORE `<arpa/inet.h>`. glibc's arpa/inet.h happens to drag in
+ * the AF_* constants; FreeBSD's does not, so this file builds on Linux and fails
+ * on FreeBSD with "use of undeclared identifier 'AF_INET'". Same defect the pf
+ * sources had; found by running the suite on FreeBSD 16.0.
+ */
+#include <sys/socket.h>
+#include <sys/types.h>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdlib.h>
