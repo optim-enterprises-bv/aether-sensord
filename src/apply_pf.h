@@ -127,6 +127,21 @@ enum pf_apply_result pf_apply_del(struct pf_apply_ctx *c, const char *table,
                                   char *err, size_t err_len);
 
 /*
+ * Remove every element from `table`, leaving the table itself declared.
+ *
+ * Needed for a LIST (full snapshot): after a resync the table's contents must
+ * match the snapshot exactly, so entries the controller has dropped must go. A
+ * delta protocol never needs this; a resync does.
+ *
+ * Measured on FreeBSD 16.0: `pfctl -t <t> -T flush` prints "N addresses deleted."
+ * and empties the table. Note the obvious-looking alternative does NOT work --
+ * `pfctl -F tables` fails with "Unknown flush modifier 'tables'", so a script
+ * that "cleans up" with it silently does nothing.
+ */
+enum pf_apply_result pf_apply_flush(struct pf_apply_ctx *c, const char *table,
+                                    char *err, size_t err_len);
+
+/*
  * Read the table's contents. Returns the byte count written, or -1 if the table
  * could not be read -- which includes it not existing, the case that matters
  * most. An absent table yields an empty string to a careless reader and -1 here.
