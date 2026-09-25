@@ -113,6 +113,62 @@ enum sni_result sni_extract_frame(const uint8_t *frame, size_t len, char *out,
                                   uint32_t *tcp_seq);
 
 /*
+ * The 5-tuple of a frame, for keying per-flow state and for building an
+ * enforcement element.
+ *
+ * Returns SNI_OK when IPv4/TCP (or UDP) was parsed and `out` is filled, and a
+ * non-OK result otherwise. Deliberately NOT a bool: a caller that cannot tell
+ * "not IPv4" from "truncated" will mis-count its own coverage, and this layer
+ * exists precisely to make coverage visible.
+ *
+ * This exists separately from sni_extract_frame because the two answer
+ * different questions -- "what name is on the wire" and "which flow is this" --
+ * and bundling them would put the flow identity behind the SNI parser's
+ * success, so a flow whose ClientHello has not arrived yet would have no
+ * identity and could not be keyed for reassembly at all. That is a real
+ * ordering problem, not a hypothetical one: the first packets of a connection
+ * carry no ClientHello.
+ *
+ * `have_smac` is set from the Ethernet source address. On a ROUTED firewall
+ * that is the router's address, not the original client's -- an accurate
+ * reading of the frame and a structural limit of the identity model.
+ */
+struct sni_tuple {
+	uint8_t saddr[16];
+	uint8_t daddr[16];
+	uint8_t family;      /* 4 or 6; only 4 is produced today */
+	uint8_t proto;       /* IPPROTO_TCP (6) / IPPROTO_UDP (17) */
+	uint16_t sport;
+	uint16_t dport;
+	uint8_t smac[6];
+	bool have_smac;
+};
+
+enum sni_result sni_frame_tuple(const uint8_t *frame, size_t len,
+                                struct sni_tuple *out);
+
+/*
+ * Extract the Ethernet SOURCE MAC from a frame.
+ *
+ * Separate from sni_extract_frame rather than an extra output parameter,
+ * because the two questions have different audiences: the frame parser wants a
+ * hostname, and the policy layer wants to know WHICH CLIENT the flow came from.
+ * Adding a 7th out-parameter to a function four call sites already use would
+ * churn all of them to serve one.
+ *
+ * Returns true when a MAC was read. False means the frame is too short, is not
+ * Ethernet, or is not IPv4 -- caller must then treat the flow as having NO
+ * subject rather than substituting a default, because picking a default subject
+ * silently applies one client's policy to every other client.
+ *
+ * NOTE for a ROUTED firewall: this is the MAC ON THE WIRE, which for traffic
+ * being forwarded by a router is the ROUTER's address, not the original
+ * client's. That is an accurate reading of the frame and a structural limit of
+ * the identity model, not a parse failure -- see local_decide.c.
+ */
+bool sni_frame_src_mac(const uint8_t *frame, size_t len, uint8_t out[6]);
+
+/*
  * Does this result mean the caller knows there is nothing to enforce?
  *
  * True only for SNI_NONE and SNI_NOT_TLS -- the two cases where the answer is

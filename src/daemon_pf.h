@@ -52,6 +52,8 @@
 #include "apply_pf.h"
 #include "canary_pf.h"
 #include "feed.h"
+#include "policy.h"
+#include "sigdb.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -93,6 +95,47 @@ struct dpf_config {
 	 * that is running but not enforcing is worse than one that is down: the
 	 * down one gets noticed. */
 	bool tolerant;
+
+	/*
+	 * THE LOCAL CAPTURE PATH.
+	 *
+	 * These are the settings for looking at traffic THIS DEVICE sees, as
+	 * opposed to the reputation feed, which is the cloud telling it what to
+	 * block. The two are independent: the feed can arrive with local
+	 * capture turned off entirely, and vice versa.
+	 */
+
+	/* Table that addresses observed locally go into. DELIBERATELY SEPARATE
+	 * from `table`, which holds feed reputation.
+	 *
+	 * The two have different lifetimes and different consequences. A feed
+	 * prefix is a considered judgement about a network and can persist for
+	 * hours. A local detection is one observation of one destination, and
+	 * it should expire quickly. Mixing them in one table means either the
+	 * detections never expire or the reputation does -- and neither is
+	 * something an operator asked for. Empty disables local blocking. */
+	char table_local[PF_TABLE_NAME_MAX];
+
+	/* Interface to capture on. Empty disables local capture. NEVER name the
+	 * interface carrying the management session: the capture reattaches it,
+	 * and a failure mid-attach takes the session with it. */
+	char capture_iface[64];
+
+	/* Enforce, or only report. Defaults to FALSE and the default is the
+	 * safe direction: observe mode runs the entire pipeline, including the
+	 * pf decision, and simply does not write. Turning this on is the one
+	 * choice that can interrupt traffic. */
+	bool capture_enforce;
+
+	/* Flows to drain from the capture per pass before moving on. Bounded so
+	 * a busy interface cannot make a pass run for ever and starve the feed. */
+	unsigned capture_max_flows;
+
+	/* The signature database to match against, when local capture is on. */
+	char sigdb_path[DPF_PATH_MAX];
+
+	/* The policy file defining subjects and rules. */
+	char policy_path[DPF_PATH_MAX];
 };
 
 void dpf_config_defaults(struct dpf_config *cfg);
@@ -191,7 +234,82 @@ struct dpf_pass_stats {
 	uint32_t retained;
 };
 
+/*
+ * The LOCAL half of a pass, separated so its arithmetic is reportable on its
+ * own.
+ *
+ * Deliberately NOT folded into the feed counters above. A feed pass that
+ * applied 40 prefixes and a local pass that blocked 2 destinations are
+ * different statements about what the firewall is doing, and an operator
+ * reading "applied=42" would have no way to know which half was responsible
+ * for a given block.
+ */
+struct dpf_local_stats {
+	uint32_t available;   /* the capture path was usable this pass */
+	uint32_t flows;       /* flows drained from the capture */
+	uint32_t decided;     /* block verdicts reached */
+	uint32_t applied;     /* elements CONFIRMED in the table */
+	uint32_t failed;      /* attempted, not confirmed */
+	uint32_t truncated;   /* capture had more; drain was bounded */
+	uint32_t skipped;     /* capture unavailable (not an error by itself) */
+};
+
+/*
+ * A captured flow, as the daemon's local pass consumes it. The capture layer
+ * produces these; keeping the type here (rather than taking a struct ng_sni)
+ * is what lets the daemon pass be exercised on Linux, where netgraph does not
+ * exist.
+ */
+struct dpf_local_flow {
+	char host[256];
+	uint8_t proto;
+	uint16_t dport;
+	uint8_t daddr[16];
+	uint8_t daddr_family;
+	bool have_daddr;
+	uint8_t smac[6];
+	bool have_smac;
+};
+
 int dpf_run_pass(struct dpf_config *cfg, struct pf_apply_ctx *ap,
                  struct feed_client *fc, struct dpf_pass_stats *out);
+
+/*
+ * Where local flows come from. A function pointer, so a test can supply flows
+ * directly and the production path can ask the netgraph capture.
+ *
+ * Returns the number written (0 when there are none), or -1 for a capture error
+ * the caller should count rather than treat as "no traffic" -- an interface that
+ * has stopped passing traffic and an interface with nothing to say are very
+ * different, and a single 0 for both is how a dead capture looks healthy.
+ */
+typedef int (*dpf_flow_source_fn)(void *user, struct dpf_local_flow *out,
+                                  size_t cap);
+
+/*
+ * Run the local half of a pass: drain the capture, decide, apply.
+ *
+ * `src` NULL means local capture is not configured: the function returns
+ * immediately with skipped set, and touches no pf state.
+ *
+ * Returns the number of elements CONFIRMED, or -1 on a bad argument. A false
+ * return of 0 here is ambiguous between "nothing to block" and "nothing was
+ * attempted", which is why the caller must read the stats rather than the
+ * return value to find out. That ambiguity is inherent (they really are both
+ * zero blocks) but it must not be papered over with a different number.
+ */
+int dpf_run_local(struct dpf_config *cfg, struct pf_apply_ctx *ap,
+                  const struct sig_db *db, const struct pol_db *pol,
+                  dpf_flow_source_fn src, void *src_user,
+                  struct dpf_local_stats *out);
+
+/*
+ * Flows drained from the capture per pass. Bounded: a busy interface would
+ * otherwise let the local half of a pass run indefinitely and starve the feed,
+ * so the bound is a fairness property, not a memory one. Hitting it sets
+ * `truncated` in the stats -- the traffic is not dropped, it waits for the next
+ * pass.
+ */
+#define DPF_LOCAL_MAX_FLOWS 256
 
 #endif /* AETHER_SENSORD_DAEMON_PF_H */

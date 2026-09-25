@@ -427,6 +427,39 @@ int ng_sni_next(struct ng_sni *g, struct reasm_flow *flow, int timeout_ms,
 	                       &payload, &payload_len, &seq);
 
 	/*
+	 * THE 5-TUPLE IS FILLED ON EVERY FRAME, before any SNI question is
+	 * answered -- and that ordering is the point.
+	 *
+	 * ng_sni_verdict has always documented that it carries the tuple
+	 * ("The 5-tuple is copied out into `key`, so a caller can maintain its
+	 * own table without re-parsing the frame"), and until now NOTHING EVER
+	 * WROTE THOSE FIELDS: they were declared and never assigned, so a
+	 * caller keying its flow table on them got all-zero keys. Every flow
+	 * would have hashed to the same bucket, and multi-segment reassembly
+	 * would have interleaved unrelated connections.
+	 *
+	 * It has to happen before the SNI result is examined, because the first
+	 * packets of a connection carry no ClientHello at all: if the tuple
+	 * depended on the SNI parse succeeding, a flow could not be identified
+	 * until after it was already supposed to be keyed.
+	 */
+	{
+		struct sni_tuple t;
+		enum sni_result tr = sni_frame_tuple(frame, (size_t)n, &t);
+
+		if (tr == SNI_FOUND) {
+			memcpy(verdict->saddr, t.saddr, sizeof verdict->saddr);
+			memcpy(verdict->daddr, t.daddr, sizeof verdict->daddr);
+			verdict->proto = t.proto;
+			verdict->sport = t.sport;
+			verdict->dport = t.dport;
+			verdict->have_tuple = true;
+		} else {
+			verdict->have_tuple = false;
+		}
+	}
+
+	/*
 	 * DO NOT GATE ON "IS THIS TLS". Feed every TCP payload in the flow to the
 	 * reassembler and let IT decide; that is the entire reason it exists.
 	 *

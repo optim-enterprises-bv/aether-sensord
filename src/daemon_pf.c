@@ -13,7 +13,11 @@
  * between OpenWrt and FreeBSD.
  */
 
+#include <time.h>
+
 #include "daemon_pf.h"
+#include "local_decide.h"
+#include "local_enforce.h"
 
 #include "canary_pf.h"
 #include "feed.h"
@@ -49,6 +53,23 @@ void dpf_config_defaults(struct dpf_config *cfg)
 	snprintf(cfg->spool_out, sizeof(cfg->spool_out), "/var/spool/aether/out");
 	cfg->serial[0] = '\0';
 	cfg->canary_enabled = true;
+
+	/*
+	 * LOCAL CAPTURE DEFAULTS TO OFF, and that is the safe direction.
+	 *
+	 * Enabling it is the only setting here that can interrupt traffic, and it
+	 * involves reattaching a live interface. A default of "on" would mean an
+	 * upgrade silently starts touching the datapath of a firewall whose
+	 * operator only ever wanted the reputation feed.
+	 */
+	cfg->table_local[0] = '\0';
+	cfg->capture_iface[0] = '\0';
+	cfg->capture_enforce = false;
+	cfg->capture_max_flows = DPF_LOCAL_MAX_FLOWS;
+	snprintf(cfg->sigdb_path, sizeof(cfg->sigdb_path),
+	         "/usr/local/share/aisense/appdb.cfg");
+	snprintf(cfg->policy_path, sizeof(cfg->policy_path),
+	         "/usr/local/etc/aisense/policy.conf");
 	/*
 	 * Tolerant defaults to FALSE: a failed apply stops the daemon. A running
 	 * daemon that is not enforcing is worse than a stopped one, because only
@@ -213,6 +234,43 @@ enum dpf_cfg_result dpf_config_parse(struct dpf_config *cfg, const char *text,
 				goto bad;
 		} else if (strcmp(key, "tolerant") == 0) {
 			if (!parse_bool(val, &cfg->tolerant))
+				goto bad;
+		} else if (strcmp(key, "table_local") == 0) {
+			if (!copy_bounded(cfg->table_local,
+			                  sizeof(cfg->table_local), val))
+				goto bad;
+			/*
+			 * THE TABLE NAME IS VALIDATED HERE, not at apply time.
+			 *
+			 * A malformed name reaches pfctl as an argument and fails
+			 * there, which is late -- the capture would already be
+			 * attached and reading. Refusing it at parse time means a
+			 * typo is a config error the operator sees on start, not a
+			 * silent failure a week later.
+			 */
+			if (val[0] != '\0' && !pf_table_name_ok(cfg->table_local))
+				goto bad;
+		} else if (strcmp(key, "capture_iface") == 0) {
+			if (!copy_bounded(cfg->capture_iface,
+			                  sizeof(cfg->capture_iface), val))
+				goto bad;
+		} else if (strcmp(key, "capture_enforce") == 0) {
+			if (!parse_bool(val, &cfg->capture_enforce))
+				goto bad;
+		} else if (strcmp(key, "capture_max_flows") == 0) {
+			char *endp = NULL;
+			long v = strtol(val, &endp, 10);
+			if (!endp || *endp != '\0' || v < 1 ||
+			    v > DPF_LOCAL_MAX_FLOWS)
+				goto bad;
+			cfg->capture_max_flows = (unsigned)v;
+		} else if (strcmp(key, "sigdb_path") == 0) {
+			if (!copy_bounded(cfg->sigdb_path,
+			                  sizeof(cfg->sigdb_path), val))
+				goto bad;
+		} else if (strcmp(key, "policy_path") == 0) {
+			if (!copy_bounded(cfg->policy_path,
+			                  sizeof(cfg->policy_path), val))
 				goto bad;
 		} else {
 			if (worst == DPF_CFG_OK) {
@@ -452,6 +510,169 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 	       (unsigned long long)msg.serial, msg.n_add, msg.n_remove);
 	unlink(path);
 	st->applied++;
+}
+
+/*
+ * The local half of a pass.
+ *
+ * Reads flows from `src`, decides against the signature database and policy, and
+ * applies what survives. The enforcement proof is locef_apply's: elements are
+ * only counted as applied when they are READ BACK from the table, so an add that
+ * pfctl accepted but did not store is a failure here, not a success.
+ *
+ * OBSERVE MODE STILL RUNS THE WHOLE DECISION. It is not a dry run in the sense of
+ * "pretend nothing happened" -- every flow is matched, every policy rule is
+ * evaluated, and the would_block counts are real. What it does not do is write.
+ * That is what makes it useful for answering "what would this block" before
+ * anyone agrees to let it block.
+ */
+int dpf_run_local(struct dpf_config *cfg, struct pf_apply_ctx *ap,
+                  const struct sig_db *db, const struct pol_db *pol,
+                  dpf_flow_source_fn src, void *src_user,
+                  struct dpf_local_stats *out)
+{
+	struct dpf_local_flow flows[DPF_LOCAL_MAX_FLOWS];
+	struct locdec_flow lf[DPF_LOCAL_MAX_FLOWS];
+	struct locdec_block blocks[LOCDEC_MAX_BLOCKS];
+	struct locdec_stats dstats;
+	struct locef_stats estats;
+	struct pol_time now;
+	int got, i, n_blocks;
+
+	if (out)
+		memset(out, 0, sizeof *out);
+	if (!cfg || !ap)
+		return -1;
+
+	/*
+	 * "NOT CONFIGURED" and "CONFIGURED BUT BROKEN" are different states and
+	 * must not share a counter.
+	 *
+	 * An earlier version folded `!db || !pol` into this same branch, and the
+	 * consequence was that a daemon configured to capture but unable to load
+	 * its signature database reported `skipped` -- identical to capture
+	 * being switched off. That is the failure direction this project
+	 * forbids: a misconfiguration that silently reads as a deliberate
+	 * choice. It also made a test pass for the wrong reason, which is how
+	 * the flaw was found.
+	 */
+	if (!src || cfg->table_local[0] == '\0' || cfg->capture_iface[0] == '\0') {
+		if (out)
+			out->skipped = 1;
+		return 0;
+	}
+
+	/*
+	 * From here the operator HAS asked for local capture, so a missing
+	 * database or policy is a fault, reported as such. Returning -1 rather
+	 * than 0 means a caller running with `tolerant=false` can refuse to
+	 * claim it is enforcing.
+	 */
+	if (!db || !pol) {
+		if (out) {
+			out->available = 1;
+			out->failed++;
+		}
+		return -1;
+	}
+
+	if (out)
+		out->available = 1;
+
+	got = src(src_user, flows, DPF_LOCAL_MAX_FLOWS);
+	if (got < 0) {
+		/*
+		 * A capture error is NOT "no traffic". Reporting it as zero flows
+		 * would make a dead capture indistinguishable from an idle
+		 * interface.
+		 */
+		if (out)
+			out->skipped = 1;
+		return 0;
+	}
+	if ((size_t)got > DPF_LOCAL_MAX_FLOWS)
+		got = (int)DPF_LOCAL_MAX_FLOWS;
+
+	/* The capture filled the buffer: more is waiting. Say so. */
+	if (out && (size_t)got == DPF_LOCAL_MAX_FLOWS)
+		out->truncated = 1;
+
+	for (i = 0; i < got; i++) {
+		memset(&lf[i], 0, sizeof lf[i]);
+		lf[i].host = flows[i].host;
+		lf[i].proto = flows[i].proto;
+		lf[i].dport = flows[i].dport;
+		memcpy(lf[i].daddr, flows[i].daddr, sizeof lf[i].daddr);
+		lf[i].daddr_family = flows[i].daddr_family;
+		lf[i].have_daddr = flows[i].have_daddr;
+		memcpy(lf[i].smac, flows[i].smac, sizeof lf[i].smac);
+		lf[i].have_smac = flows[i].have_smac;
+	}
+
+	/*
+	 * Time comes from the clock, not from a parameter: this IS the
+	 * production caller, and the policy layer needs wall time for its
+	 * windows and quotas. Tests of the decision logic call locdec_fold
+	 * directly with a supplied time.
+	 */
+	memset(&now, 0, sizeof now);
+	{
+		time_t t = time(NULL);
+		struct tm lt;
+
+		if (localtime_r(&t, &lt) != NULL) {
+			/*
+			 * pol_time.wday matches struct tm exactly (0 = Sunday),
+			 * and min_of_day is minutes since midnight -- NOT seconds.
+			 * Passing seconds here would put every flow outside every
+			 * window, so the whole local path would silently allow
+			 * everything during hours where a block rule was meant to
+			 * apply. It is a two-character mistake with the failure
+			 * direction that matters.
+			 */
+			now.wday = lt.tm_wday;
+			now.min_of_day =
+			    (uint16_t)(lt.tm_hour * 60 + lt.tm_min);
+		}
+	}
+
+	n_blocks = locdec_fold(db, pol, lf, (size_t)got, now, 0,
+	                       cfg->capture_enforce, blocks,
+	                       sizeof blocks / sizeof blocks[0], &dstats, NULL, 0,
+	                       NULL);
+	if (n_blocks < 0) {
+		if (out)
+			out->failed++;
+		return -1;
+	}
+
+	if (out) {
+		out->flows = dstats.flows;
+		out->decided = dstats.blocked;
+	}
+
+	if (n_blocks == 0)
+		return 0;
+
+	/*
+	 * Apply. In observe mode locef_apply writes nothing and returns true,
+	 * so the confirmed count stays 0 and the caller cannot mistake this for
+	 * enforcement.
+	 */
+	if (!locef_apply(ap, cfg->table_local, blocks, (size_t)n_blocks,
+	                 cfg->capture_enforce, cfg->capture_enforce, &estats)) {
+		if (out) {
+			out->failed += estats.failed;
+			out->applied += estats.confirmed;
+		}
+		return -1;
+	}
+
+	if (out) {
+		out->applied = estats.confirmed;
+		out->failed += estats.failed;
+	}
+	return (int)estats.confirmed;
 }
 
 int dpf_run_pass(struct dpf_config *cfg, struct pf_apply_ctx *ap,

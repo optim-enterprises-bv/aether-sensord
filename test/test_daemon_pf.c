@@ -548,6 +548,296 @@ static void test_missing_spool_is_not_an_error(void)
 	CHECK(st.seen == 0, "nothing seen");
 }
 
+/* ------------------------------------------- the LOCAL capture half of a pass */
+
+/*
+ * These are about the one failure direction this project forbids: reporting
+ * enforcement that is not happening. The tests drive dpf_run_local through an
+ * injected flow source, so they run on Linux where netgraph does not exist --
+ * which is the reason the flow source is a function pointer at all.
+ */
+
+static int src_offlined; /* a source that reports a capture ERROR */
+
+static int flow_src_error(void *user, struct dpf_local_flow *out, size_t cap)
+{
+	(void)user;
+	(void)out;
+	(void)cap;
+	return -1;
+}
+
+static int flow_src_none(void *user, struct dpf_local_flow *out, size_t cap)
+{
+	(void)user;
+	(void)out;
+	(void)cap;
+	return 0;
+}
+
+static struct dpf_local_flow *g_flows;
+static int g_n_flows;
+
+static int flow_src_fixed(void *user, struct dpf_local_flow *out, size_t cap)
+{
+	int n = g_n_flows;
+
+	(void)user;
+	if ((size_t)n > cap)
+		n = (int)cap;
+	memcpy(out, g_flows, (size_t)n * sizeof(*out));
+	return n;
+}
+
+static void mk_local_flow(struct dpf_local_flow *f, const char *host,
+                          const char *addr, bool with_mac)
+{
+	memset(f, 0, sizeof *f);
+	snprintf(f->host, sizeof f->host, "%s", host);
+	f->proto = SIG_PROTO_TCP;
+	f->dport = 443;
+	if (addr) {
+		/* parse through the real parser, so the test cannot disagree
+		 * with the daemon about binary representation */
+		char buf[64];
+		struct pf_elem e;
+		snprintf(buf, sizeof buf, "%s/32", addr);
+		if (pf_elem_parse(buf, 0, &e) == PF_OK) {
+			memcpy(f->daddr, e.addr, sizeof f->daddr);
+			f->daddr_family = e.family;
+			f->have_daddr = true;
+		}
+	}
+	if (with_mac) {
+		f->smac[0] = 0x02; f->smac[1] = 0; f->smac[2] = 0;
+		f->smac[3] = 0; f->smac[4] = 0; f->smac[5] = 0x01;
+		f->have_smac = true;
+	}
+}
+
+static void test_local_is_off_unless_configured(void)
+{
+	struct dpf_config c;
+	struct pf_apply_ctx ap;
+	struct dpf_local_stats st;
+	int r;
+
+	dpf_config_defaults(&c);
+	pf_apply_ctx_init(&ap, NULL, NULL);
+
+	CHECK(c.table_local[0] == '\0' && c.capture_iface[0] == '\0',
+	      "local capture is OFF by default");
+	CHECK(c.capture_enforce == false,
+	      "and enforcing is off by default -- enabling it is the only "
+	      "setting that can interrupt traffic");
+
+	/*
+	 * With no table configured, the local half must not run at all.
+	 */
+	r = dpf_run_local(&c, &ap, NULL, NULL, flow_src_none, NULL, &st);
+	CHECK(r == 0, "an unconfigured local path does nothing");
+	CHECK(st.skipped == 1 && st.available == 0,
+	      "and reports skipped, so 'off' and 'idle' are distinguishable");
+}
+
+static void test_a_capture_error_is_not_no_traffic(void)
+{
+	struct dpf_config c;
+	struct pf_apply_ctx ap;
+	struct dpf_local_stats st;
+
+	dpf_config_defaults(&c);
+	pf_apply_ctx_init(&ap, NULL, NULL);
+	snprintf(c.table_local, sizeof c.table_local, "aisense_local4");
+	snprintf(c.capture_iface, sizeof c.capture_iface, "epair0b");
+	c.capture_enforce = true;
+
+	/*
+	 * A CONFIGURED path whose capture has failed. This must be exercised
+	 * with a real database and policy in hand, because an earlier version
+	 * of this test passed NULL for both and therefore returned early on the
+	 * "not configured" branch -- asserting the right value for entirely the
+	 * wrong reason. A mutation that turned a capture error into "no
+	 * traffic" survived that test.
+	 */
+	{
+		struct sig_db db;
+		struct pol_db pol;
+		FILE *fp;
+		static const char *DBT =
+		    "#format v2.0\n"
+		    "11001 YouTube:[tcp;;;youtube.com;;]\n";
+
+		sig_db_init(&db);
+		fp = fmemopen((void *)DBT, strlen(DBT), "r");
+		sig_db_load(&db, fp);
+		fclose(fp);
+		pol_db_init(&pol);
+
+		/*
+		 * The distinction that matters: an interface that has stopped
+		 * passing traffic and an interface with nothing to say both
+		 * produce zero blocks, and only one of them is healthy.
+		 */
+		dpf_run_local(&c, &ap, &db, &pol, flow_src_error, NULL, &st);
+		CHECK(st.available == 1,
+		      "the configured path reports itself available even when "
+		      "the capture fails");
+		CHECK(st.skipped == 1,
+		      "a capture ERROR reports skipped, NOT 'zero flows' -- a "
+		      "dead capture must not look like an idle interface");
+		CHECK(st.flows == 0, "and no flows are invented for it");
+
+		sig_db_free(&db);
+		pol_db_free(&pol);
+	}
+	src_offlined = 1;
+}
+
+/*
+ * A CONFIGURED path with no database is a FAULT, not a skip. It must not be
+ * reported the same way as capture being switched off, or a daemon that cannot
+ * load its signatures reads as one that was never asked to.
+ */
+static void test_configured_without_a_database_is_a_fault(void)
+{
+	struct dpf_config c;
+	struct pf_apply_ctx ap;
+	struct dpf_local_stats st;
+	int r;
+
+	dpf_config_defaults(&c);
+	pf_apply_ctx_init(&ap, NULL, NULL);
+	snprintf(c.table_local, sizeof c.table_local, "aisense_local4");
+	snprintf(c.capture_iface, sizeof c.capture_iface, "epair0b");
+
+	r = dpf_run_local(&c, &ap, NULL, NULL, flow_src_none, NULL, &st);
+	CHECK(r == -1,
+	      "capture configured but no signature database: a FAULT (-1), "
+	      "not a silent skip");
+	CHECK(st.skipped == 0,
+	      "and it is NOT counted as skipped, which is what capture being "
+	      "switched off looks like");
+	CHECK(st.failed == 1, "it is counted as failed");
+}
+
+static void test_observe_mode_decides_but_writes_nothing(void)
+{
+	struct dpf_config c;
+	struct pf_apply_ctx ap;
+	struct dpf_local_stats st;
+	struct sig_db db;
+	struct pol_db pol;
+	FILE *fp;
+	static const char *DBT =
+	    "#format v2.0\n"
+	    "11001 YouTube:[tcp;;;youtube.com;;]\n";
+
+	dpf_config_defaults(&c);
+	pf_apply_ctx_init(&ap, NULL, NULL);
+	snprintf(c.table_local, sizeof c.table_local, "aisense_local4");
+	snprintf(c.capture_iface, sizeof c.capture_iface, "epair0b");
+	c.capture_enforce = false; /* OBSERVE */
+
+	sig_db_init(&db);
+	fp = fmemopen((void *)DBT, strlen(DBT), "r");
+	sig_db_load(&db, fp);
+	fclose(fp);
+
+	pol_db_init(&pol);
+	{
+		uint8_t mac[POL_MAC_LEN] = { 0x02, 0, 0, 0, 0, 0x01 };
+		struct pol_rule r;
+		size_t kid = pol_add_subject(&pol, mac, "kid");
+		memset(&r, 0, sizeof r);
+		r.subject_index = (uint16_t)kid;
+		r.target = POL_TARGET_APP;
+		r.action = POL_BLOCK;
+		snprintf(r.tag, sizeof r.tag, "youtube");
+		pol_add_rule(&pol, &db, &r);
+	}
+
+	g_flows = calloc(1, sizeof(*g_flows));
+	mk_local_flow(&g_flows[0], "youtube.com", "203.0.113.10", true);
+	g_n_flows = 1;
+
+	dpf_run_local(&c, &ap, &db, &pol, flow_src_fixed, NULL, &st);
+	CHECK(st.flows == 1, "the flow was seen");
+	CHECK(st.decided == 1,
+	      "the POLICY decision was reached -- observe mode runs the whole "
+	      "decision, it just does not write");
+	CHECK(st.applied == 0,
+	      "but nothing was applied, which is the only number that may be "
+	      "read as enforcement");
+
+	free(g_flows);
+	g_flows = NULL;
+	g_n_flows = 0;
+	sig_db_free(&db);
+	pol_db_free(&pol);
+}
+
+static void test_a_local_batch_is_confirmed_or_failed(void)
+{
+	struct dpf_config c;
+	struct pf_apply_ctx ap;
+	struct dpf_local_stats st;
+	struct sig_db db;
+	struct pol_db pol;
+	FILE *fp;
+	static const char *DBT =
+	    "#format v2.0\n"
+	    "11001 YouTube:[tcp;;;youtube.com;;]\n";
+
+	dpf_config_defaults(&c);
+	/*
+	 * No exec function: pfctl cannot be run, so the apply must FAIL and be
+	 * reported as failed rather than counted as applied.
+	 */
+	pf_apply_ctx_init(&ap, NULL, NULL);
+	snprintf(c.table_local, sizeof c.table_local, "aisense_local4");
+	snprintf(c.capture_iface, sizeof c.capture_iface, "epair0b");
+	c.capture_enforce = true;
+
+	sig_db_init(&db);
+	fp = fmemopen((void *)DBT, strlen(DBT), "r");
+	sig_db_load(&db, fp);
+	fclose(fp);
+
+	pol_db_init(&pol);
+	{
+		uint8_t mac[POL_MAC_LEN] = { 0x02, 0, 0, 0, 0, 0x01 };
+		struct pol_rule r;
+		size_t kid = pol_add_subject(&pol, mac, "kid");
+		memset(&r, 0, sizeof r);
+		r.subject_index = (uint16_t)kid;
+		r.target = POL_TARGET_APP;
+		r.action = POL_BLOCK;
+		snprintf(r.tag, sizeof r.tag, "youtube");
+		pol_add_rule(&pol, &db, &r);
+	}
+
+	g_flows = calloc(1, sizeof(*g_flows));
+	mk_local_flow(&g_flows[0], "youtube.com", "203.0.113.10", true);
+	g_n_flows = 1;
+
+	dpf_run_local(&c, &ap, &db, &pol, flow_src_fixed, NULL, &st);
+	CHECK(st.decided == 1, "the decision is still reached");
+	/*
+	 * THE PROPERTY: with pf unreachable, applied MUST be 0. A version that
+	 * counted the decision as an application would report enforcement for a
+	 * firewall that did nothing.
+	 */
+	CHECK(st.applied == 0,
+	      "with pf unreachable, applied is 0 -- never the decision count");
+
+	free(g_flows);
+	g_flows = NULL;
+	g_n_flows = 0;
+	sig_db_free(&db);
+	pol_db_free(&pol);
+}
+
 int main(void)
 {
 	test_defaults_are_safe();
@@ -565,6 +855,12 @@ int main(void)
 	test_a_failed_apply_retains_the_file();
 	test_ignores_non_json_and_dotfiles();
 	test_missing_spool_is_not_an_error();
+
+	test_local_is_off_unless_configured();
+	test_a_capture_error_is_not_no_traffic();
+	test_configured_without_a_database_is_a_fault();
+	test_observe_mode_decides_but_writes_nothing();
+	test_a_local_batch_is_confirmed_or_failed();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

@@ -521,8 +521,117 @@ static void test_not_tls_is_normal(void)
 	}
 }
 
+/*
+ * Source-MAC extraction. Small surface, but the failure mode it guards is a
+ * zero MAC comparing equal to the "no subject" sentinel, which would turn a
+ * truncated capture into a policy subject lookup.
+ */
+static void test_src_mac(void)
+{
+	uint8_t f[64];
+	uint8_t mac[6];
+
+	memset(f, 0, sizeof f);
+	/* dest */
+	memcpy(f, "\xaa\xbb\xcc\xdd\xee\xff", 6);
+	/* src: the one we want */
+	memcpy(f + 6, "\x02\x00\x00\x00\x00\x2a", 6);
+	f[12] = 0x08; f[13] = 0x00; /* IPv4 */
+
+	CHECK(sni_frame_src_mac(f, sizeof f, mac) == true,
+	      "a MAC is read from a well-formed IPv4 Ethernet frame");
+	CHECK(mac[5] == 0x2a && mac[0] == 0x02,
+	      "and it is the SOURCE address (offset 6), not the destination");
+
+	CHECK(sni_frame_src_mac(f, 10, mac) == false,
+	      "a frame shorter than an Ethernet header is refused, so a "
+	      "truncated capture cannot become a zero-MAC subject");
+
+	/* a non-IPv4 frame is refused even though the MAC is readable */
+	f[12] = 0x86; f[13] = 0xdd; /* IPv6 */
+	CHECK(sni_frame_src_mac(f, sizeof f, mac) == false,
+	      "an IPv6 frame is refused: the MAC is readable but this policy "
+	      "layer cannot evaluate the flow, so it must not become a subject");
+
+	/* NULL safety */
+	CHECK(sni_frame_src_mac(NULL, 64, mac) == false,
+	      "a NULL frame is refused");
+	CHECK(sni_frame_src_mac(f, sizeof f, NULL) == false,
+	      "a NULL output is refused");
+}
+
+/*
+ * The 5-tuple extractor.
+ *
+ * This function exists because ng_sni_verdict declared a 5-tuple that nothing
+ * ever wrote -- every frame produced an all-zero key. The tests below build
+ * frames whose ports and addresses are DISTINCT and NON-ZERO precisely so that a
+ * regression to "never fills them" cannot pass by producing matching zeros.
+ */
+static void test_frame_tuple(void)
+{
+	uint8_t f[128];
+	struct sni_tuple t;
+
+	memset(f, 0, sizeof f);
+	memcpy(f, "\xaa\xbb\xcc\xdd\xee\xff", 6);
+	memcpy(f + 6, "\x02\x00\x00\x00\x00\x2a", 6);
+	f[12] = 0x08; f[13] = 0x00;
+	/* IPv4 header at 14 */
+	f[14] = 0x45;             /* version 4, IHL 5 */
+	f[16] = 0x00; f[17] = 0x28; /* total length 40 */
+	f[22] = 64;               /* TTL */
+	f[23] = 6;                /* TCP */
+	/* src 192.0.2.9, dst 198.51.100.7 */
+	f[26] = 192; f[27] = 0; f[28] = 2; f[29] = 9;
+	f[30] = 198; f[31] = 51; f[32] = 100; f[33] = 7;
+	/* TCP at 34: sport 51413, dport 443 */
+	f[34] = 0xc8; f[35] = 0xd5;
+	f[36] = 0x01; f[37] = 0xbb;
+	f[46] = 0x50;             /* data offset 5 */
+
+	CHECK(sni_frame_tuple(f, sizeof f, &t) == SNI_FOUND,
+	      "a well-formed IPv4/TCP frame yields a tuple");
+	CHECK(t.family == 4, "family is 4");
+	CHECK(t.proto == 6, "protocol is TCP");
+	CHECK(t.sport == 51413, "source port read");
+	CHECK(t.dport == 443, "destination port read");
+	CHECK(t.daddr[0] == 198 && t.daddr[3] == 7,
+	      "destination address read");
+	CHECK(t.saddr[0] == 192 && t.saddr[3] == 9,
+	      "source address read");
+	CHECK(t.have_smac && t.smac[5] == 0x2a,
+	      "and the source MAC is carried alongside");
+
+	/*
+	 * A UDP frame is a tuple too: DNS and QUIC are flows the policy layer
+	 * wants to key even though they carry no SNI.
+	 */
+	f[23] = 17;
+	CHECK(sni_frame_tuple(f, sizeof f, &t) == SNI_FOUND,
+	      "a UDP frame is a valid tuple");
+	CHECK(t.proto == 17, "and is reported as UDP, not TCP");
+
+	/* a truncated frame must NOT produce a plausible half-tuple */
+	CHECK(sni_frame_tuple(f, 20, &t) != SNI_FOUND,
+	      "a truncated IP header is refused rather than read past");
+
+	/* a non-IPv4 frame is not this layer's business */
+	f[12] = 0x86; f[13] = 0xdd;
+	CHECK(sni_frame_tuple(f, sizeof f, &t) != SNI_FOUND,
+	      "an IPv6 frame is refused (not implemented), not silently read "
+	      "as IPv4");
+
+	CHECK(sni_frame_tuple(NULL, 64, &t) != SNI_FOUND, "NULL frame refused");
+	CHECK(sni_frame_tuple(f, sizeof f, NULL) != SNI_FOUND,
+	      "NULL output refused");
+}
+
 int main(void)
 {
+	test_src_mac();
+	test_frame_tuple();
+
 	printf("=== SNI extraction ===\n");
 	test_extracts_a_sni();
 	test_no_extension_is_none_not_an_error();
