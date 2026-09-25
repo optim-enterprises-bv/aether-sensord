@@ -307,6 +307,138 @@ incomplete:
 	(void)body_len;
 }
 
+enum sni_result sni_frame_tuple(const uint8_t *frame, size_t len,
+                                struct sni_tuple *out)
+{
+	size_t off = 0;
+	uint16_t ethertype;
+	size_t ihl, ip_hdr, l4;
+	uint32_t ip_total;
+	uint8_t proto;
+
+	if (!out)
+		return SNI_MALFORMED;
+	memset(out, 0, sizeof *out);
+
+	if (!frame || len < 14)
+		return SNI_INCOMPLETE;
+
+	/* the source MAC is readable as soon as the Ethernet header is */
+	memcpy(out->smac, frame + 6, 6);
+	out->have_smac = true;
+
+	ethertype = (uint16_t)((frame[12] << 8) | frame[13]);
+	while (ethertype == 0x8100 || ethertype == 0x88a8) {
+		if (len < off + 18)
+			return SNI_INCOMPLETE;
+		off += 4;
+		ethertype = (uint16_t)((frame[off + 12] << 8) |
+		                       frame[off + 13]);
+	}
+	if (ethertype != 0x0800)
+		return SNI_NOT_TLS; /* not IPv4: no tuple this layer uses */
+
+	if (len < off + 14 + 20)
+		return SNI_INCOMPLETE;
+
+	{
+		const uint8_t *ip = frame + off + 14;
+		ihl = (size_t)(ip[0] & 0x0f) * 4;
+		ip_total = ((uint32_t)ip[2] << 8) | ip[3];
+		proto = ip[9];
+		ip_hdr = off + 14;
+
+		/*
+		 * Reject fragments below the first. A non-first fragment has no
+		 * transport header, so reading ports out of it would produce a
+		 * plausible-looking tuple from the middle of a payload.
+		 */
+		{
+			uint16_t flags_frag =
+			    (uint16_t)((ip[6] << 8) | ip[7]);
+			if ((flags_frag & 0x1fff) != 0)
+				return SNI_INCOMPLETE;
+		}
+
+		if (ihl < 20 || len < ip_hdr + ihl)
+			return SNI_MALFORMED;
+		if (ip_total < ihl)
+			return SNI_MALFORMED;
+
+		memcpy(out->saddr, ip + 12, 4);
+		memcpy(out->daddr, ip + 16, 4);
+		out->family = 4;
+		out->proto = proto;
+
+		l4 = ip_hdr + ihl;
+		if (proto == 6 || proto == 17) {
+			if (len < l4 + 4)
+				return SNI_INCOMPLETE;
+			out->sport = (uint16_t)((frame[l4] << 8) |
+			                        frame[l4 + 1]);
+			out->dport = (uint16_t)((frame[l4 + 2] << 8) |
+			                        frame[l4 + 3]);
+			/*
+			 * TCP with a data offset below the minimum is
+			 * malformed; report it rather than returning a tuple
+			 * whose header length the caller would trust.
+			 */
+			if (proto == 6) {
+				size_t doff;
+
+				if (len < l4 + 13)
+					return SNI_INCOMPLETE;
+				doff = (size_t)(frame[l4 + 12] >> 4) * 4;
+				if (doff < 20)
+					return SNI_MALFORMED;
+			}
+		}
+	}
+
+	return SNI_FOUND;
+}
+
+bool sni_frame_src_mac(const uint8_t *frame, size_t len, uint8_t out[6])
+{
+	size_t off = 0;
+	uint16_t ethertype;
+
+	if (!frame || !out)
+		return false;
+	/*
+	 * Need at least a full Ethernet header to read the source address. A
+	 * shorter frame is a truncated capture, not a MAC-less client, so it is
+	 * refused rather than zero-filled: a zero MAC would compare equal to the
+	 * zero MAC the policy layer uses for "no subject", which would silently
+	 * turn a truncated frame into a subject lookup.
+	 */
+	if (len < 14)
+		return false;
+
+	memcpy(out, frame + 6, 6);
+
+	ethertype = (uint16_t)((frame[12] << 8) | frame[13]);
+	/* Walk 802.1Q VLAN tags exactly as the frame parser does. */
+	while (ethertype == 0x8100 || ethertype == 0x88a8) {
+		if (len < off + 18)
+			return false;
+		off += 4;
+		ethertype = (uint16_t)((frame[off + 12] << 8) |
+		                       frame[off + 13]);
+	}
+	/*
+	 * Only IPv4 is accepted. A frame that is not IPv4 is not a failure to
+	 * read a MAC -- the MAC was read fine -- but the caller asks "which
+	 * client is this flow from", and for a non-IPv4 frame the flow is not
+	 * one this policy layer can evaluate. Returning the MAC would invite the
+	 * caller to treat it as a subject.
+	 */
+	if (ethertype != 0x0800)
+		return false;
+
+	return true;
+}
+
 enum sni_result sni_extract_frame(const uint8_t *frame, size_t len, char *out,
                                   size_t out_len, size_t *need,
                                   const uint8_t **tcp_payload,

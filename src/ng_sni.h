@@ -144,6 +144,17 @@ struct ng_sni_verdict {
 	uint8_t daddr[16];
 	uint16_t sport;
 	uint16_t dport;
+	/*
+	 * Whether the tuple above is valid, and why this flag has to exist:
+	 *
+	 * these fields are zero-initialised by the caller, and a zero tuple is
+	 * indistinguishable from a real one whose addresses happen to be zero.
+	 * Without this flag a caller keying a flow table would silently group
+	 * every unparseable frame under one all-zero key -- which is the bug
+	 * that made these fields dead code in the first place, just in a new
+	 * costume.
+	 */
+	bool have_tuple;
 	bool truncated;       /* our window was too small for this traffic */
 };
 

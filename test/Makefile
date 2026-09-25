@@ -14,7 +14,8 @@ CFLAGS ?= -std=gnu11 -Wall -Wextra -Werror -O1 -g -D_GNU_SOURCE
 # quietly omits the tests it cannot build is worse than one that fails.
 BINS = test_sigdb test_policy test_nft test_feed test_apply \
        test_sni test_reassembly test_bpf_tls \
-       test_observe test_polcfg test_offload test_canary
+       test_observe test_polcfg test_offload test_canary \
+       test_local_decide test_local_enforce
 
 # These sources include Linux kernel UAPI headers (linux/netlink.h,
 # linux/netfilter/nfnetlink*.h, linux/neighbour.h) and CANNOT build on FreeBSD.
@@ -80,8 +81,44 @@ ifeq ($(PCAP_LDFLAGS),)
 PCAP_LDFLAGS := -lpcap
 endif
 
+# libpcap's DEVELOPMENT files are needed for the BPF interpreter test, and they
+# are NOT implied by the runtime library: on Fedora the package is libpcap-devel,
+# on FreeBSD it is in the base system. Without them <pcap/bpf.h> is missing and
+# the build stops -- which is the correct outcome, but the raw error ("fatal
+# error: pcap/bpf.h: No such file or directory") reads like a source defect
+# rather than a missing dependency. Detect it explicitly so the message says
+# what to install.
+#
+# The alternative -- quietly dropping this test -- was rejected: it is the ONLY
+# test that executes the generated BPF bytecode through the kernel's own
+# interpreter, so skipping it would silently remove the check that the programs
+# are valid machine code, at the point where "the suite is green" would then be
+# a statement about a reduced suite.
+HAVE_PCAP_HDR := $(shell echo '#include <pcap/bpf.h>' | \
+	$(CC) $(PCAP_CFLAGS) -E - >/dev/null 2>&1 && echo yes)
+ifeq ($(HAVE_PCAP_HDR),)
+BINS := $(filter-out test_bpf_tls,$(BINS))
+SKIPPED += test_bpf_tls
+endif
+
 test_bpf_tls: test_bpf_tls.c ../src/bpf_tls.h
 	$(CC) $(CFLAGS) $(PCAP_CFLAGS) -o $@ test_bpf_tls.c $(PCAP_LDFLAGS)
+
+# The local decision path: the join between the capture layer and pf. It is
+# portable (no netgraph, no pfctl) so it builds and runs on both platforms.
+test_local_decide: test_local_decide.c ../src/local_decide.c ../src/local_decide.h \
+		../src/policy.c ../src/sigdb.c ../src/match.c ../src/pf.c
+	$(CC) $(CFLAGS) -o $@ test_local_decide.c ../src/local_decide.c \
+		../src/policy.c ../src/sigdb.c ../src/match.c ../src/pf.c
+
+# The enforcement bridge: decisions -> pf state, driven through a fake pfctl so
+# the "pfctl lied" failure modes are reachable. Portable.
+test_local_enforce: test_local_enforce.c ../src/local_enforce.c ../src/local_enforce.h \
+		../src/local_decide.c ../src/policy.c ../src/sigdb.c ../src/match.c \
+		../src/pf.c ../src/apply_pf.c
+	$(CC) $(CFLAGS) -o $@ test_local_enforce.c ../src/local_enforce.c \
+		../src/local_decide.c ../src/policy.c ../src/sigdb.c ../src/match.c \
+		../src/pf.c ../src/apply_pf.c
 
 test_polcfg: test_polcfg.c ../src/polcfg.c ../src/policy.c ../src/sigdb.c ../src/polcfg.h
 	$(CC) $(CFLAGS) -o $@ test_polcfg.c ../src/polcfg.c ../src/policy.c ../src/sigdb.c
@@ -127,9 +164,33 @@ else
 	@echo "   The scope decision (QUIC must never be name-hashed) and the"
 	@echo "   enforcement split are NOT covered by this run."
 endif
+	@if [ -n "$(SKIPPED)" ]; then \
+		echo "-- SKIPPED (dependency absent): $(SKIPPED)"; \
+		echo "   install libpcap-devel (Fedora) / libpcap-dev (Debian);"; \
+		echo "   without it the generated BPF bytecode is never executed"; \
+		echo "   through the interpreter, so this run is NOT the full suite."; \
+	fi
 	@for b in $(BINS); do echo "-- $$b"; ./$$b || exit 1; done
+# ---------------------------------------------------------------------------
+# LIVE tests. FreeBSD only: they build a real netgraph graph and must never be
+# run on the machine carrying your session (they create and destroy epairs).
+# They are NOT part of `check`, because `check` must be safe to run anywhere.
+live_capture_source: test/live_capture_source.c ../src/capture_source.c \
+		../src/ng_sni.c ../src/sni.c ../src/reassembly.c ../src/daemon_pf.c \
+		../src/pf.c ../src/apply_pf.c ../src/canary_pf.c ../src/feed.c \
+		../src/local_decide.c ../src/local_enforce.c ../src/policy.c \
+		../src/sigdb.c ../src/match.c ../src/nft.c
+	$(CC) $(CFLAGS) -I../src -include ../src/feed_pf.h -o $@ \
+		test/live_capture_source.c ../src/capture_source.c \
+		../src/ng_sni.c ../src/sni.c ../src/reassembly.c \
+		../src/daemon_pf.c ../src/pf.c ../src/apply_pf.c \
+		../src/canary_pf.c ../src/feed.c ../src/local_decide.c \
+		../src/local_enforce.c ../src/policy.c ../src/sigdb.c \
+		../src/match.c ../src/nft.c -lnetgraph -lpthread
+
 clean:
-	rm -f $(BINS) $(LINUX_BINS) test_dpi test_appblock dpi_replay
+	rm -f $(BINS) $(LINUX_BINS) test_dpi test_appblock dpi_replay \
+		live_capture_source live_attach live_ng_sni
 
 test_flowlog: test_flowlog.c ../src/flowlog.c ../src/appblock.c ../src/match.c ../src/sigdb.c ../src/observe.c ../src/afpush.c ../src/policy.c
 	$(CC) $(CFLAGS) -o $@ test_flowlog.c ../src/flowlog.c ../src/appblock.c ../src/match.c ../src/sigdb.c ../src/observe.c ../src/afpush.c ../src/policy.c
