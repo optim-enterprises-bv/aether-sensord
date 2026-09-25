@@ -157,7 +157,13 @@ static enum pf_apply_result run_table_op(struct pf_apply_ctx *c,
 	}
 	argv[argc] = NULL;
 
-	if (argc == 5) {
+	/*
+	 * `flush` legitimately carries no elements, so an argv of exactly
+	 * `pfctl -t <table> -T flush` is valid for it. The guard below is about
+	 * elements that were OFFERED and refused, which is a different thing --
+	 * testing argc alone conflated the two and made every flush fail.
+	 */
+	if (n > 0 && argc == 5) {
 		/* Every element was unrenderable. Nothing to send, and reporting
 		 * success here would be a lie. */
 		for (size_t i = 5; i < argc; i++)
@@ -208,6 +214,14 @@ enum pf_apply_result pf_apply_del(struct pf_apply_ctx *c, const char *table,
 	if (!elems)
 		return PF_APPLY_REJECTED;
 	return run_table_op(c, table, "delete", elems, n, err, err_len);
+}
+
+enum pf_apply_result pf_apply_flush(struct pf_apply_ctx *c, const char *table,
+                                    char *err, size_t err_len)
+{
+	/* No elements: the argv is just `pfctl -t <table> -T flush`, which
+	 * run_table_op builds correctly with n == 0. */
+	return run_table_op(c, table, "flush", NULL, 0, err, err_len);
 }
 
 /*

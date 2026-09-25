@@ -1,0 +1,59 @@
+# aether-sensord-pf configuration  --  /usr/local/etc/aether-sensord.conf
+#
+# Plain KEY = VALUE. Comments start with # or ;.
+#
+# THIS FILE IS THE REPLACEMENT FOR OpenWrt's UCI /etc/config/aether-sensord. The
+# keys map one-to-one onto the UCI options; the format changed because FreeBSD
+# has no UCI and growing a bespoke parser for seven scalar values would be a
+# liability with no payoff. Unknown keys and unusable values are REFUSED (the
+# daemon exits non-zero) rather than ignored -- a silently-ignored key left the
+# daemon able to enforce into the wrong table while every counter read healthy.
+#
+# An option absent from this file keeps its default, shown in brackets.
+
+# Where feed messages are delivered. The transport writes one .json file per
+# message and the daemon removes it once applied.
+# [default: /var/spool/aether/in]
+spool_dir = /var/spool/aether/in
+
+# The pf table the reputation set lives in.
+#
+# THIS MUST BE REGISTERED AS AN OPNSENSE STATIC ALIAS or nothing is enforced:
+#   System > Firmware > Plugins has no UI for it. Edit
+#   /usr/local/opnsense/mvc/app/models/OPNsense/Firewall/static_aliases/core.json
+#   and add an entry of type "external", or create a normal Firewall > Aliases
+#   entry of type external and let OPNsense generate the rule.
+#
+# The daemon checks at startup that this table is referenced by a rule and
+# REFUSES TO START if it is not, because `pfctl -t <undeclared> -T add` CREATES
+# the table rather than failing -- so a mistake here presents as a daemon that
+# applies every message successfully and blocks nothing.
+# [default: aisense_rep4]
+table = aisense_rep4
+
+# IPv6 table. Empty disables v6 handling rather than guessing a name.
+# [default: aisense_rep6]
+table_v6 = aisense_rep6
+
+# Seconds between spool passes. [default: 5]
+interval_sec = 5
+
+# Where the canary writes its verdict for the uplink. Empty disables it.
+# [default: /var/spool/aether/out]
+spool_out = /var/spool/aether/out
+
+# This device's identity in canary reports. Empty omits the field rather than
+# sending an empty string, which a collector would have to interpret.
+# [default: empty]
+#serial = 
+
+# Run the enforcement canary each interval. [default: on]
+canary = on
+
+# Keep running after a failed apply.
+#
+# Defaults to off, deliberately: a daemon that is running but not enforcing is
+# worse than one that has stopped, because only the stopped one gets
+# investigated. Set to on only where a supervision layer reports the failure.
+# [default: off]
+tolerant = off

@@ -1,0 +1,70 @@
+#!/bin/sh
+# Copyright (C) 2026 Optim Enterprises BV
+#
+# This is free software, licensed under the BSD 3-Clause License.
+#
+# rc.d script for aether-sensord-pf on FreeBSD / OPNsense.
+#
+# Installed as /usr/local/etc/rc.d/aether_sensord (note the underscore: FreeBSD
+# rc.d names cannot contain '-', so the service NAME differs from the binary and
+# the package name. `service aether_sensord start` is correct and
+# `service aether-sensord start` is not -- worth stating because the mismatch
+# reads as a typo rather than a convention).
+#
+# WHY rc.subr AND NOT procd. The OpenWrt package uses procd, which restarts the
+# daemon when its config changes. rc.subr has no equivalent, so a config change
+# needs an explicit `service aether_sensord restart`. Not reimplementing that via
+# a watcher is deliberate: a supervisor looping on a config file is a new failure
+# mode in exchange for saving one command.
+
+# PROVIDE: aether_sensord
+# REQUIRE: NETWORKING pf
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="aether_sensord"
+rcvar="aether_sensord_enable"
+
+: ${aether_sensord_enable:="NO"}
+: ${aether_sensord_config:="/usr/local/etc/aether-sensord.conf"}
+: ${aether_sensord_bin:="/usr/local/sbin/aether-sensord-pf"}
+
+pidfile="/var/run/${name}.pid"
+# daemon(8) owns the pidfile via -p, and the program must NOT daemonise itself:
+# calling daemon() there forks a SECOND time, so daemon(8)'s child exits at once,
+# the pidfile is removed, and `service aether_sensord stop` can never find the
+# process -- while the daemon keeps running and enforcing. Measured, not reasoned.
+#
+# -f is NOT passed. In daemon(8) -f means --close-fds, not "foreground"; the
+# foreground behaviour is simply not passing -o.
+procname="${aether_sensord_bin}"
+command="/usr/sbin/daemon"
+command_args="-p ${pidfile} ${procname} -c ${aether_sensord_config}"
+
+start_precmd="aether_sensord_prestart"
+
+aether_sensord_prestart()
+{
+	if [ ! -x "${procname}" ]; then
+		err 1 "${procname} is not executable"
+	fi
+
+	# daemon(8) backgrounds the program and reports success regardless of what
+	# it then does, so a daemon that refuses to start (bad config, or a table
+	# no rule references) would look like a successful start. `-t` checks both
+	# in the foreground and exits non-zero, so rc sees the real answer.
+	#
+	# This is the check that makes "it started" mean something: the daemon
+	# refuses when it cannot enforce, because applying into a table no rule
+	# references -- or one that does not exist, which `pfctl -T add` would
+	# silently CREATE -- blocks nothing while reporting success.
+	if [ -f "${aether_sensord_config}" ] || [ -x "${procname}" ]; then
+		if ! "${procname}" -c "${aether_sensord_config}" -t; then
+			err 1 "aether-sensord-pf refuses to run: see the message above"
+		fi
+	fi
+}
+
+load_rc_config $name
+run_rc_command "$1"
