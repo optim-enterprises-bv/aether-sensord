@@ -73,7 +73,7 @@ static const char *next_string(const char *p, const char *end, char *buf,
 }
 
 /* Collect address strings from a JSON array into `dst`. */
-static void collect_array(const char *p, const char *end, struct nft_elem *dst,
+static void collect_array(const char *p, const char *end, FEED_ELEM_TYPE *dst,
                           size_t cap, size_t *n_out, uint32_t *rejected,
                           uint32_t *overflowed)
 {
@@ -94,8 +94,15 @@ static void collect_array(const char *p, const char *end, struct nft_elem *dst,
 			return;
 		p = next;
 
-		struct nft_elem e;
-		if (nft_elem_parse(text, &e) != NFT_OK) {
+		/*
+		 * The parse entry point and the timeout are the only two things
+		 * that differ between datapaths, so both are macros. pf rejects
+		 * a per-element timeout as unrepresentable rather than carrying
+		 * one it cannot honour (see PF_REJECT_TIMEOUT_UNSUPPORTED).
+		 */
+		FEED_ELEM_TYPE e;
+		if (!feed_elem_parse(text, &e) ||
+		    feed_elem_set_timeout(&e, FEED_ELEM_TIMEOUT) != 0) {
 			(*rejected)++;
 		} else if (*n_out >= cap) {
 			(*overflowed)++;
