@@ -122,7 +122,7 @@ static int set_program(int cs, const char *node,
 }
 
 /*
- * The COARSE per-packet filter, run in kernel.
+ * The coarse per-packet filter, run in kernel.
  *
  * OFFSETS, computed rather than guessed -- getting these wrong is invisible
  * because the program still installs and simply never matches, which looks
@@ -134,13 +134,12 @@ static int set_program(int cs, const char *node,
  *   +5 for the record header -> 59 = the handshake message type
  *
  * That is all a per-packet program can honestly do: it cannot see a name that
- * spans segments, which is exactly why reassembly.c exists one layer up.
+ * spans segments, which is exactly why the reassembler exists one layer up.
  *
- * KNOWN LIMITATION, stated rather than implied: these are fixed offsets, so a
- * VLAN-TAGGED frame shifts everything by 4 and will not match. On a trunk port
- * this program silently matches nothing. Handling that needs either a second
- * program on the tagged offset or the tag stripped upstream; it is not done
- * here and a caller must not read "no matches on the trunk" as "no TLS".
+ * KNOWN LIMITATION, stated rather than implied: fixed offsets mean a
+ * VLAN-TAGGED frame shifts everything by 4 and will not match, so on a trunk
+ * port this program silently matches nothing. A caller must not read "no
+ * matches on the trunk" as "no TLS".
  */
 static int install_match(int cs, const char *node)
 {
@@ -266,6 +265,7 @@ int ng_sni_next(struct ng_sni *g, struct reasm_flow *flow, int timeout_ms,
 	unsigned char frame[REASM_CAP + 64];
 	const uint8_t *payload = NULL;
 	size_t payload_len = 0, need = 0;
+	uint32_t seq = 0;
 	char host[SNI_MAX_NAME];
 	enum sni_result sr;
 	ssize_t n;
@@ -295,7 +295,7 @@ int ng_sni_next(struct ng_sni *g, struct reasm_flow *flow, int timeout_ms,
 		return 0;
 
 	sr = sni_extract_frame(frame, (size_t)n, host, sizeof host, &need,
-	                       &payload, &payload_len);
+	                       &payload, &payload_len, &seq);
 
 	if (sr == SNI_NOT_TLS || payload == NULL) {
 		verdict->reasm = REASM_NOT_TLS;
@@ -311,20 +311,18 @@ int ng_sni_next(struct ng_sni *g, struct reasm_flow *flow, int timeout_ms,
 
 	/*
 	 * Hand the TLS bytes to the reassembler rather than deciding from one
-	 * frame. This is the whole reason reassembly.c exists: a ClientHello
+	 * frame. This is the whole reason the reassembler exists: a ClientHello
 	 * routinely spans segments, and a per-frame decision would miss exactly
 	 * those flows -- the ones a user is most likely to be using, since
 	 * modern browsers send large ClientHellos.
 	 *
-	 * NOTE on sequence numbers: the caller supplies them. A netgraph capture
-	 * point does not hand us the TCP sequence, so a caller that hooks this
-	 * to a real interface must take the seq from the frame itself (and
-	 * ng_sni_verdict carries nowhere to put it yet). Until that is wired,
-	 * passing 0 makes the reassembler treat each segment as contiguous,
-	 * which is correct only when the ClientHello happens to fit in one
-	 * frame -- i.e. this is a KNOWN GAP, not a finished path.
+	 * The sequence number comes from the frame, so segments are placed at
+	 * their real offsets and out-of-order delivery is handled correctly. A
+	 * caller still owns the per-flow reassembly state: two flows interleaved
+	 * through this function would corrupt each other, so `flow` must be
+	 * keyed by the 5-tuple (see ng_sni_verdict, which carries it).
 	 */
-	verdict->reasm = reasm_feed(flow, 0, payload, payload_len, host,
+	verdict->reasm = reasm_feed(flow, seq, payload, payload_len, host,
 	                            sizeof host);
 	verdict->truncated = reasm_was_truncated(flow);
 	if (verdict->reasm == REASM_FOUND)

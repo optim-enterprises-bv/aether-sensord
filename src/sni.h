@@ -95,7 +95,11 @@ enum sni_result sni_extract(const uint8_t *data, size_t len, char *out,
  *
  * `*tcp_payload` and `*tcp_payload_len` receive the TLS region on success or
  * when SNI_INCOMPLETE/SNI_NONE is returned, so a caller can cache the bytes and
- * reassemble across segments.
+ * reassemble across segments. `*tcp_seq` receives the segment's sequence number
+ * -- the FIRST payload byte's sequence -- which is what a reassembler needs to
+ * place this segment correctly. Without it, out-of-order delivery cannot be
+ * handled and a ClientHello spanning segments is unparseable. Any of the three
+ * output pointers may be NULL.
  *
  * NOT YET HANDLED, stated rather than implied: IPv6, IP fragmentation, and TCP
  * segment reassembly. Each returns SNI_NOT_TLS or SNI_INCOMPLETE rather than a
@@ -105,7 +109,8 @@ enum sni_result sni_extract(const uint8_t *data, size_t len, char *out,
 enum sni_result sni_extract_frame(const uint8_t *frame, size_t len, char *out,
                                   size_t out_len, size_t *need,
                                   const uint8_t **tcp_payload,
-                                  size_t *tcp_payload_len);
+                                  size_t *tcp_payload_len,
+                                  uint32_t *tcp_seq);
 
 /*
  * Does this result mean the caller knows there is nothing to enforce?

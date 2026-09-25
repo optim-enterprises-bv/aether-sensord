@@ -47,10 +47,17 @@
 static int failures;
 static int checks;
 
+/*
+ * Prints each check as it passes, deliberately: this is an integration test
+ * whose EVIDENCE is which cases ran. A bare "0 failures" would not distinguish
+ * a run that exercised the multi-segment path from one that skipped it.
+ */
 #define CHECK(cond, msg)                                                      \
 	do {                                                                  \
 		checks++;                                                     \
-		if (!(cond)) {                                                \
+		if (cond) {                                                   \
+			printf("  ok: %s\n", (msg));                          \
+		} else {                                                      \
 			failures++;                                           \
 			printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
 		}                                                             \
@@ -341,6 +348,7 @@ int main(void)
 		char host[SNI_MAX_NAME];
 		const unsigned char *pl = NULL;
 		size_t pl_len = 0, need = 0;
+		uint32_t seq = 0;
 		enum sni_result sr;
 		int found = 0;
 		size_t k;
@@ -351,12 +359,39 @@ int main(void)
 		CHECK(found, "CASE 1: the SNI hostname is present in the bytes "
 		             "that reached userspace");
 
-		/* and the parser recovers it, which is what a decision needs */
+ 	/* and the parser recovers it, which is what a decision needs */
 		sr = sni_extract_frame(rbuf, (size_t)rc, host, sizeof host, &need,
-		                       &pl, &pl_len);
+		                       &pl, &pl_len, &seq);
 		CHECK(sr == SNI_FOUND, "CASE 1: sni_extract_frame parses it");
 		CHECK(strcmp(host, sni) == 0,
 		      "CASE 1: and recovers exactly the injected hostname");
+
+ 	/*
+ 	 * THE MULTI-SEGMENT CASE, which is why the reassembler exists.
+ 	 * Feed the TLS bytes as two segments delivered OUT OF ORDER and
+ 	 * require the hostname. This is the flow a per-packet matcher
+ 	 * cannot handle and a user is most likely to be using, since
+ 	 * modern browsers send large ClientHellos.
+ 	 */
+		if (pl != NULL && pl_len > 20) {
+			struct reasm_flow flow;
+			char host2[SNI_MAX_NAME];
+			size_t half = pl_len / 2;
+			enum reasm_result r1, r2;
+
+			reasm_init(&flow);
+ 		/* tail first, then head -- the realistic reorder */
+			r1 = reasm_feed(&flow, seq + (uint32_t)half,
+			                pl + half, pl_len - half, host2,
+			                sizeof host2);
+			r2 = reasm_feed(&flow, seq, pl, half, host2, sizeof host2);
+			(void)r1;
+			CHECK(r2 == REASM_FOUND && strcmp(host2, sni) == 0,
+			      "CASE 1b: a ClientHello split across two segments and "
+			      "delivered OUT OF ORDER still yields the hostname");
+		} else {
+			CHECK(0, "CASE 1b: the payload was too short to split");
+	}
 	}
 
 	/* CASE 2: a non-ClientHello must NOT reach us */
