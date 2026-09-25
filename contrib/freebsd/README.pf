@@ -1,0 +1,139 @@
+Aether reputation enforcement for OPNsense / FreeBSD, on pf
+===========================================================
+
+Port of net/aether-sensord from the optim-wrt feed. The nftables mechanism
+becomes pf; the enforcement *proof* is preserved and strengthened.
+
+WHAT THIS PACKAGE CURRENTLY SHIPS
+---------------------------------
+aether-sensord-pfcanary -- the enforcement canary. It answers one question
+without reading any configuration: is this firewall actually blocking traffic
+from the reputation table, or does the table merely exist?
+
+Exit status is 0 only for `enforced`. Every other verdict, including
+`inconclusive`, exits non-zero, so a monitor cannot be fooled by "could not
+check".
+
+    192.0.2.199  <-- the canary address (TEST-NET-1, cannot carry real traffic)
+
+Verdicts, and what each means:
+
+    enforced          the MAIN ruleset references the table; a rule is in the
+                      datapath
+    set_missing       the table does not exist -- the declaration never landed
+    add_rejected      pfctl refused the element
+    not_held          pfctl accepted it and the table does not list it
+    not_enforced      THE ONE THIS EXISTS TO CATCH: the table exists and holds
+                      the entry, and no rule refers to it, so nothing is ever
+                      dropped
+    cleanup_failed    enforcement works but the canary was left behind
+    inconclusive      the check could not be run
+
+`not_enforced` is the failure this whole mechanism exists for. Nothing errors.
+The table lists its contents. Every other signal agrees that enforcement is
+live. It is what an anchor-based OPNsense plugin produces by construction,
+because OPNsense's generated ruleset contains zero anchor lines.
+
+THE ENFORCEMENT SEAM
+--------------------
+Do NOT load reputation rules into a pf anchor. OPNsense regenerates its ruleset
+from config.xml on every filter reload, so an anchor's rules exist, print
+correctly under `pfctl -a <name> -s rules`, and are never evaluated.
+
+Register the table as an OPNsense static alias of type `external` instead:
+
+    /usr/local/opnsense/mvc/app/models/OPNsense/Firewall/static_aliases/core.json
+
+    {
+      "aisense_rep4": {
+        "enabled": "1",
+        "name": "aisense_rep4",
+        "type": "external",
+        "description": "AIsense reputation feed (aether-sensord)",
+        "expire": "3600",
+        "content": ""
+      }
+    }
+
+OPNsense then generates the rule referencing it. Precedent: `sshlockout` is
+referenced 4 times in the generated ruleset and `virusprot` 3 times. `expire`
+gives kernel-side decay, so a feed that stops refreshing stops blocking instead
+of leaving a stale table enforcing forever.
+
+Populate it out of band:
+
+    pfctl -t aisense_rep4 -T add 203.0.113.7
+
+Precedent to copy: /usr/local/opnsense/scripts/syslog/lockout_handler, which
+populates `sshlockout`.
+
+TWO MEASURED TRAPS
+------------------
+Both were hit building this port. Each gives a confidently wrong answer, and
+they pull in opposite directions.
+
+1. pf does not report a drop to the sender. On Linux netfilter a blocked output
+   packet returns EPERM to the socket, and the original daemon used that as
+   proof. pf discards silently -- measured with the canary held in an enforcing
+   table: sends=10 refused=0. So a sendto()-based probe reports NOT_ENFORCED
+   against a perfectly defending firewall, and an operator who learns to ignore
+   that verdict has lost the only signal that matters. The verdict here comes
+   from pf's own state, never from the send result.
+
+2. The per-table `Rules:` count in `pfctl -vvsT` is NOT enforcement evidence. It
+   counts rules mentioning the table anywhere, including inside an anchor the
+   main ruleset never calls. Measured state where it lies:
+
+       References:  [ Anchors: 1   Rules: 1  ]              <- looks enforced
+       pfctl -s rules | grep -c '<aisense_rep4>'  ->  0      <- nothing live
+
+   A canary trusting that count reports ENFORCED on a firewall that blocks
+   nothing -- fabricated protection, the worst possible error. This port checks
+   the MAIN ruleset for a `<table>` reference instead.
+
+   The deliberate cost: a hand-written config that enforces from a *called*
+   anchor reads as NOT_ENFORCED. That trade is correct -- a missed enforcement
+   prompts a look, an invented one does not -- and it does not affect the
+   static-alias design above, whose rule is generated into the main ruleset.
+
+Also note: `pfctl -F all` does NOT flush anchors. Between test cases, run
+`pfctl -a <name> -F rules` for each entry in `pfctl -s Anchors`, or a stale
+anchor keeps supplying reference counts that make the next case look enforced.
+
+WHAT PORTS FROM THE OPENWRT PACKAGE
+-----------------------------------
+    ports unchanged (pure C):     nft rendering logic -> src/pf.c
+                                 canary logic       -> src/canary_pf.c
+                                 policy/sigdb/match + appdb data
+    ports, different mechanism:  nftables sets  -> pf tables + static aliases
+                                 NFLOG          -> pflog
+                                 UCI /etc/config -> OPNsense model + config.xml
+                                 procd init     -> rc.d
+
+    does NOT port:
+      kmod-aether-af   a Linux kernel module hashing TLS SNI / HTTP host for
+                       in-kernel name matching. FreeBSD has no equivalent hook,
+                       so the name-hash half of enforcement has no datapath
+                       here. Address and tuple enforcement via pf is unaffected.
+      libndpi          linked on OpenWrt for protocol identification. Its value
+                       is classification, not enforcement. Left out of the first
+                       cut so the package carries no LGPL dependency it does not
+                       yet use.
+
+BUILDING
+--------
+    ./build-pkg.sh /path/to/aether-sensord-checkout [outdir]
+    pkg add <outdir>/aether-sensord-pf-0.1.0.pkg
+
+No ports tree required. The tests run first and a failing test stops the build.
+
+VERIFYING AN INSTALL
+--------------------
+    aether-sensord-pfcanary aisense_rep4          # exit 0 only when enforcing
+    aether-sensord-pfcanary aisense_rep4 --spool /var/spool/aether
+
+`--spool` writes the verdict as NDJSON where the uplink will find it, written to
+a .partial and renamed so a consumer never reads half a record. It is emitted on
+every run, not only when the verdict changes: the controller treats an absent
+verdict as an alarm, so the steady stream of passes is the heartbeat that makes
+silence meaningful.
