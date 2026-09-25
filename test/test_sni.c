@@ -378,20 +378,55 @@ static void test_frame_walk(void)
 	size_t need = 0;
 	const uint8_t *pl = NULL;
 	size_t pl_len = 0;
+	uint32_t seq = 0;
 
 	n = build_ch(ch, sizeof ch, "frame.example.net", 0);
 	fn = wrap(frame, ch, n, 0, 0, 0);
 	CHECK(sni_extract_frame(frame, fn, (char *)out, sizeof out, &need, &pl,
-	                        &pl_len) == SNI_FOUND,
+	                        &pl_len, &seq) == SNI_FOUND,
 	      "the frame walk reaches the SNI through Eth/IPv4/TCP");
 	CHECK(strcmp((char *)out, "frame.example.net") == 0, "correct name");
 	CHECK(pl != NULL && pl_len > 0,
 	      "the TLS payload pointer is reported so a caller can reassemble");
 
+	/*
+	 * The SEQUENCE NUMBER must come out of the frame, because the reassembler
+	 * needs it to place segments. Without it, out-of-order delivery cannot be
+	 * handled at all and a ClientHello spanning segments never parses.
+	 *
+	 * The sequence is set explicitly here rather than relying on what the
+	 * builder happens to leave in those bytes -- an earlier version asserted
+	 * a value that was actually the SOURCE PORT, so it tested nothing.
+	 * tcp_off = 14 (eth) + 20 (ipv4) = 34; seq is at tcp_off+4 = 38.
+	 */
+	frame[38] = 0xDE; frame[39] = 0xAD; frame[40] = 0xBE; frame[41] = 0xEF;
+	CHECK(sni_extract_frame(frame, fn, (char *)out, sizeof out, &need, &pl,
+	                        &pl_len, &seq) == SNI_FOUND,
+	      "the frame still parses with an explicit sequence");
+	CHECK(seq == 0xDEADBEEF,
+	      "the TCP sequence number is reported verbatim (the reassembler "
+	      "needs it to place segments)");
+
+	/* A SYN consumes one sequence number, so the payload starts at seq+1.
+	 * Getting this wrong shifts every segment by one -- and the shifted
+	 * segment is the one that carries the ClientHello header. */
+	{
+		uint8_t save = frame[14 + 20 + 13];
+
+		frame[14 + 20 + 13] = 0x02; /* SYN set */
+		CHECK(sni_extract_frame(frame, fn, (char *)out, sizeof out, &need,
+		                        &pl, &pl_len, &seq) == SNI_FOUND,
+		      "a SYN frame still parses");
+		CHECK(seq == 0xDEADBEF0,
+		      "a SYN's payload begins at seq+1 (SYN occupies a sequence "
+		      "number)");
+		frame[14 + 20 + 13] = save;
+	}
+
 	/* VLAN-tagged, as a trunk port presents. */
 	fn = wrap(frame, ch, n, 1, 0, 0);
 	CHECK(sni_extract_frame(frame, fn, (char *)out, sizeof out, &need, &pl,
-	                        &pl_len) == SNI_FOUND,
+	                        &pl_len, &seq) == SNI_FOUND,
 	      "a VLAN-tagged frame is handled");
 
 	/* A pure ACK carries no payload. */
@@ -399,7 +434,7 @@ static void test_frame_walk(void)
 		uint8_t ack[64];
 		size_t an = wrap(ack, ch, 0, 0, 0, 0);
 		CHECK(sni_extract_frame(ack, an, (char *)out, sizeof out, &need,
-		                        &pl, &pl_len) == SNI_NOT_TLS,
+		                        &pl, &pl_len, NULL) == SNI_NOT_TLS,
 		      "a pure ACK is not TLS");
 	}
 
@@ -407,7 +442,7 @@ static void test_frame_walk(void)
 	 * CALLER must not read that as 'no hostname'. Documented in sni.h. */
 	fn = wrap(frame, ch, n, 0, 100, 0);
 	CHECK(sni_extract_frame(frame, fn, (char *)out, sizeof out, &need, &pl,
-	                        &pl_len) == SNI_NOT_TLS,
+	                        &pl_len, NULL) == SNI_NOT_TLS,
 	      "an IP fragment is reported NOT_TLS rather than mis-parsed");
 
 	/* Non-IPv4 ethertype is not our business. */
@@ -416,7 +451,7 @@ static void test_frame_walk(void)
 		memset(v6, 0, sizeof v6);
 		v6[12] = 0x86; v6[13] = 0xdd;
 		CHECK(sni_extract_frame(v6, sizeof v6, (char *)out, sizeof out,
-		                        &need, &pl, &pl_len) == SNI_NOT_TLS,
+		                        &need, &pl, &pl_len, NULL) == SNI_NOT_TLS,
 		      "IPv6 is honestly reported as not handled, not guessed at");
 	}
 
@@ -424,7 +459,7 @@ static void test_frame_walk(void)
 	for (size_t k = 0; k < fn; k += 5) {
 		enum sni_result r = sni_extract_frame(frame, k, (char *)out,
 		                                      sizeof out, &need, &pl,
-		                                      &pl_len);
+		                                      &pl_len, NULL);
 		if (r == SNI_FOUND) {
 			checks++;
 			failures++;
@@ -453,7 +488,7 @@ static void test_ether_padding_does_not_break_a_short_packet(void)
 	fn = wrap(frame, ch, n, 0, 0, 0);
 	memset(frame + fn, 0, 64); /* padding, as a real NIC sends */
 	CHECK(sni_extract_frame(frame, fn + 64, (char *)out, sizeof out, &need,
-	                        &pl, &pl_len) == SNI_FOUND,
+	                        &pl, &pl_len, NULL) == SNI_FOUND,
 	      "trailing Ethernet padding does not corrupt the parse");
 	CHECK(strcmp((char *)out, "t.co") == 0, "and the name is still right");
 }

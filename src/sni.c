@@ -310,7 +310,8 @@ incomplete:
 enum sni_result sni_extract_frame(const uint8_t *frame, size_t len, char *out,
                                   size_t out_len, size_t *need,
                                   const uint8_t **tcp_payload,
-                                  size_t *tcp_payload_len)
+                                  size_t *tcp_payload_len,
+                                  uint32_t *tcp_seq)
 {
 	size_t off = 0;
 	uint16_t ethertype;
@@ -327,6 +328,8 @@ enum sni_result sni_extract_frame(const uint8_t *frame, size_t len, char *out,
 		*tcp_payload = NULL;
 	if (tcp_payload_len)
 		*tcp_payload_len = 0;
+	if (tcp_seq)
+		*tcp_seq = 0;
 	if (need)
 		*need = 0;
 	if (!frame || len < 14)
@@ -384,6 +387,27 @@ enum sni_result sni_extract_frame(const uint8_t *frame, size_t len, char *out,
 		return SNI_MALFORMED;
 
 	payload_off = tcp_off + tcp_hdr;
+
+	/*
+	 * The sequence number of the FIRST PAYLOAD byte. TCP's header sequence
+	 * counts SYN and FIN as occupying one sequence number each, so a SYN or
+	 * FIN segment's payload begins at seq+1. Getting this wrong shifts
+	 * every segment by one and breaks reassembly in a way that only shows
+	 * up on the first data segment -- which is exactly the segment carrying
+	 * a ClientHello's header.
+	 */
+	{
+		uint32_t seq = ((uint32_t)frame[tcp_off + 4] << 24) |
+		               ((uint32_t)frame[tcp_off + 5] << 16) |
+		               ((uint32_t)frame[tcp_off + 6] << 8) |
+		               (uint32_t)frame[tcp_off + 7];
+		uint8_t flags = frame[tcp_off + 13];
+
+		if (flags & 0x02) /* SYN */
+			seq += 1;
+		if (tcp_seq)
+			*tcp_seq = seq;
+	}
 
 	/*
 	 * Clamp the payload to the IP total length when it is sane. Ethernet
