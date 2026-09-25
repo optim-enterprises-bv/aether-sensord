@@ -6,6 +6,14 @@
 
 #include "nft.h"
 
+/*
+ * `<sys/socket.h>` before `<arpa/inet.h>`: glibc's arpa/inet.h happens to pull in
+ * the AF_* constants, FreeBSD's does not. Without it this file builds on Linux
+ * and fails on FreeBSD with "use of undeclared identifier 'AF_INET'". Found by
+ * building the port on FreeBSD 16.0; the pf sources had the same defect.
+ */
+#include <sys/socket.h>
+
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>

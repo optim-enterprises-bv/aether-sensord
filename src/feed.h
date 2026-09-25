@@ -33,6 +33,52 @@
 #include <stdint.h>
 
 /*
+ * The element representation this protocol carries.
+ *
+ * The protocol itself is datapath-agnostic -- it is a serial/delta/gap state
+ * machine over a set of address prefixes, and whether those end up in an nft
+ * set or a pf table is the caller's business. The one place the two met was
+ * `struct nft_elem`, whose fields (`addr[16]`, `family`, `prefix`) are already
+ * the portable part; only `timeout_sec` is nft set-attribute semantics.
+ *
+ * Overridable so the FreeBSD/pf build can substitute `struct pf_elem` and reuse
+ * this file UNCHANGED, rather than forking the gap/resync logic. A duplicate of
+ * correctness-critical serial tracking is how the two builds would drift, and a
+ * gap-handling difference is invisible from both ends of the connection.
+ *
+ * The override must expose the same `addr`, `family` and `prefix` members and
+ * provide `<T>_elem_parse(const char *text, <T>* out) == 0` on success.
+ */
+#ifndef FEED_ELEM_TYPE
+#define FEED_ELEM_TYPE struct nft_elem
+/*
+ * Parse one address string, and carry a default timeout on it.
+ *
+ * Two calls rather than one because the timeout is not a parse concern: nft
+ * accepts it verbatim, while pf cannot express a per-element timeout at all
+ * (decay there is a table property -- OPNsense's static-alias `expire`). The
+ * pf override therefore RECORDS that the timeout is unrepresentable and still
+ * ADMITS the element, because the table's `expire` provides the same decay.
+ *
+ * Note the failure mode this avoids: rejecting the element instead would make
+ * every feed entry unappliable, so the firewall would enforce nothing while
+ * looking correctly configured. A capability difference must be reported, not
+ * turned into a total loss of function.
+ */
+#define feed_elem_parse(text, out) (nft_elem_parse((text), (out)) == NFT_OK)
+static inline int feed_elem_set_timeout(struct nft_elem *e, uint32_t t)
+{
+	e->timeout_sec = t;
+	return 0;
+}
+#endif
+
+/* Default timeout carried per element. */
+#ifndef FEED_ELEM_TIMEOUT
+#define FEED_ELEM_TIMEOUT 604800u
+#endif
+
+/*
  * Consecutive missed updates tolerated before a snapshot is demanded. Turris
  * DynFW uses 10 for the same reason: large enough to ride out reordering,
  * small enough to bound how far the device can drift.
@@ -47,9 +93,9 @@ enum feed_msg_type { FEED_MSG_NONE = 0, FEED_MSG_DELTA, FEED_MSG_LIST };
 struct feed_msg {
 	enum feed_msg_type type;
 	uint64_t serial;
-	struct nft_elem add[FEED_MAX_ELEMS];
+	FEED_ELEM_TYPE add[FEED_MAX_ELEMS];
 	size_t n_add;
-	struct nft_elem remove[FEED_MAX_ELEMS];
+	FEED_ELEM_TYPE remove[FEED_MAX_ELEMS];
 	size_t n_remove;
 	/* Elements the payload offered that we refused, and why they were
 	 * refused. Reported so a feed shipping junk is visible rather than
