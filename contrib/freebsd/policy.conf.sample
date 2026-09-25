@@ -1,0 +1,67 @@
+# AIsense local policy — subjects and rules for traffic seen on THIS device.
+#
+# Copyright (C) 2026 Optim Enterprises BV. BSD 3-Clause.
+#
+# WHAT THIS FILE IS FOR
+#
+# The reputation feed answers "what should every device block". This file
+# answers "what should THIS firewall block, for WHICH client" — the per-subject
+# rules that make up a parental-control or per-segment policy.
+#
+# IT SHIPS EMPTY ON PURPOSE, and that is a safety property rather than an
+# unfinished one: an empty policy blocks nothing. Turning local blocking on
+# without writing a policy here would attach a live interface, run the whole
+# capture pipeline, and enforce nothing — which reads as "configured" in every
+# log while doing no work. Write a policy first, then enable capture.
+#
+# ---------------------------------------------------------------------------
+# SUBJECTS
+#
+# A subject is a client, identified by MAC. Rules attach to a subject, so
+# traffic from an unknown client matches no rule and is never blocked.
+#
+#   subject <mac> <label>
+#
+# IMPORTANT, AND THIS IS THE LIMIT THAT MATTERS ON A FIREWALL:
+#   These MACs must be the client's OWN address. On a ROUTED firewall a
+#   forwarded packet carries the ROUTER's source MAC, not the client's, so
+#   this file cannot match LAN clients on OPNsense the way it does on an
+#   OpenWrt AP. Until a routed-client identity source exists, local rules
+#   apply to traffic originated BY this device.
+#
+# subject 02:00:00:00:00:01 kid-tablet
+#
+# ---------------------------------------------------------------------------
+# RULES
+#
+#   block <mac|label> app <tag>          block an application for a subject
+#   allow <mac|label> app <tag>          allow it (overrides a block)
+#
+# Tags come from the signature database (share/aether-sensord/appdb.cfg). A tag
+# that names no application is REFUSED at load time and counted, so a typo is a
+# visible error rather than a rule that quietly never fires.
+#
+# block kid-tablet app youtube
+# block kid-tablet app tiktok
+#
+# ---------------------------------------------------------------------------
+# HOW TO TURN THIS ON, in order
+#
+#   1. Write at least one subject and rule above.
+#   2. Check the config parses, before touching the datapath:
+#        aether-sensord-pf -c /usr/local/etc/aether-sensord.conf -t
+#   3. Register the table as an OPNsense static alias, or nothing enforces.
+#   4. Start in OBSERVE mode first (capture_enforce = no). The whole pipeline
+#      runs and reports what it WOULD block, and writes nothing. Read the
+#      counters:
+#        local: available=1 flows=N decided=N applied=0 ...
+#      `decided` > 0 with `applied` = 0 is observe mode working as intended.
+#   5. Only then set capture_enforce = yes.
+#
+# ---------------------------------------------------------------------------
+# WHAT IT STILL WILL NOT DO
+#
+# No DNS resolution happens anywhere in this path, so a blocked destination is
+# denied from the SECOND connection onward, not the first. The address cannot be
+# known before the client's own handshake reveals it. This is advisory
+# enforcement, not a filter that stops browsing on the first attempt.

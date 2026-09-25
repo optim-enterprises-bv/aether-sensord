@@ -55,8 +55,30 @@ cc $COMMON -O1 -o "$STAGE/test_apply_pf" \
 cc $COMMON -O1 -I"$SRCDIR/src" $FEED_DEFS -o "$STAGE/test_daemon_pf" \
 	"$SRCDIR/test/test_daemon_pf.c" \
 	"$SRCDIR/src/daemon_pf.c" "$SRCDIR/src/apply_pf.c" "$SRCDIR/src/pf.c" \
-	"$SRCDIR/src/feed.c" "$SRCDIR/src/canary_pf.c"
+	"$SRCDIR/src/feed.c" "$SRCDIR/src/canary_pf.c" \
+	"$SRCDIR/src/local_decide.c" "$SRCDIR/src/local_enforce.c" \
+	"$SRCDIR/src/capture_source.c" "$SRCDIR/src/ng_sni.c" \
+	"$SRCDIR/src/sni.c" "$SRCDIR/src/reassembly.c" "$SRCDIR/src/policy.c" \
+	"$SRCDIR/src/sigdb.c" "$SRCDIR/src/match.c" -lnetgraph
 "$STAGE/test_daemon_pf"
+
+# The local decision path and its enforcement bridge. Both are portable, so
+# they run here even though the CAPTURE half needs FreeBSD.
+cc $COMMON -O1 -o "$STAGE/test_local_decide" \
+	"$SRCDIR/test/test_local_decide.c" \
+	"$SRCDIR/src/local_decide.c" "$SRCDIR/src/policy.c" "$SRCDIR/src/sigdb.c" \
+	"$SRCDIR/src/match.c" "$SRCDIR/src/pf.c"
+"$STAGE/test_local_decide"
+cc $COMMON -O1 -o "$STAGE/test_local_enforce" \
+	"$SRCDIR/test/test_local_enforce.c" \
+	"$SRCDIR/src/local_enforce.c" "$SRCDIR/src/local_decide.c" \
+	"$SRCDIR/src/policy.c" "$SRCDIR/src/sigdb.c" "$SRCDIR/src/match.c" \
+	"$SRCDIR/src/pf.c" "$SRCDIR/src/apply_pf.c"
+"$STAGE/test_local_enforce"
+cc $COMMON -O1 -o "$STAGE/test_sni" \
+	"$SRCDIR/test/test_sni.c" "$SRCDIR/src/sni.c"
+"$STAGE/test_sni"
+
 
 echo
 echo "=== 2. build the binaries ==="
@@ -69,17 +91,41 @@ cc $COMMON -O2 -o "$STAGE/root${PREFIX}/sbin/aether-sensord-pfcanary" \
 	"$SRCDIR/src/canary_pf_main.c" "$SRCDIR/src/canary_pf.c"
 chmod 0555 "$STAGE/root${PREFIX}/sbin/aether-sensord-pfcanary"
 
+# The daemon links the FULL local path: capture -> signature -> policy -> pf.
+# `-lnetgraph` because the capture source drives netgraph directly; there is no
+# kernel module to build (ng_bpf/ng_ether ship with the base system).
 cc $COMMON -O2 -I"$SRCDIR/src" $FEED_DEFS \
 	-o "$STAGE/root${PREFIX}/sbin/aether-sensord-pf" \
 	"$SRCDIR/src/daemon_pf_main.c" \
 	"$SRCDIR/src/daemon_pf.c" "$SRCDIR/src/apply_pf.c" "$SRCDIR/src/pf.c" \
-	"$SRCDIR/src/feed.c" "$SRCDIR/src/canary_pf.c"
+	"$SRCDIR/src/feed.c" "$SRCDIR/src/canary_pf.c" \
+	"$SRCDIR/src/capture_source.c" "$SRCDIR/src/ng_sni.c" \
+	"$SRCDIR/src/sni.c" "$SRCDIR/src/reassembly.c" \
+	"$SRCDIR/src/local_decide.c" "$SRCDIR/src/local_enforce.c" \
+	"$SRCDIR/src/policy.c" "$SRCDIR/src/sigdb.c" "$SRCDIR/src/match.c" \
+	"$SRCDIR/src/polcfg.c" -lnetgraph
 chmod 0555 "$STAGE/root${PREFIX}/sbin/aether-sensord-pf"
 
 install -m 0755 "$SRCDIR/contrib/freebsd/aether_sensord" \
 	"$STAGE/root${PREFIX}/etc/rc.d/aether_sensord"
 install -m 0644 "$SRCDIR/contrib/freebsd/aether-sensord.conf.sample" \
 	"$STAGE/root${PREFIX}/etc/aether-sensord.conf.sample"
+
+# Ship the OpenWrt signature database, unmodified. It is the SAME file the
+# OpenWrt daemon uses, so a fleet and a firewall cannot disagree about what an
+# app is.
+install -d -m 0755 "$STAGE/root${PREFIX}/share/aether-sensord"
+if [ -f "$SRCDIR/../optim-wrt/net/aether-appdb/files/appdb.cfg" ]; then
+	install -m 0644 "$SRCDIR/../optim-wrt/net/aether-appdb/files/appdb.cfg" \
+		"$STAGE/root${PREFIX}/share/aether-sensord/appdb.cfg"
+elif [ -n "$APPDB" ] && [ -f "$APPDB" ]; then
+	install -m 0644 "$APPDB" \
+		"$STAGE/root${PREFIX}/share/aether-sensord/appdb.cfg"
+else
+	echo "NOTE: appdb.cfg not found; local capture needs APPDB=/path/to/appdb.cfg" >&2
+fi
+install -m 0644 "$SRCDIR/contrib/freebsd/policy.conf.sample" \
+	"$STAGE/root${PREFIX}/etc/aether-sensord-policy.conf.sample" 2>/dev/null || true
 install -m 0644 "$SRCDIR/contrib/freebsd/README.pf" \
 	"$STAGE/root${PREFIX}/share/doc/aether-sensord/README.pf"
 
@@ -104,7 +150,9 @@ files: {
   "${PREFIX}/sbin/aether-sensord-pfcanary": "",
   "${PREFIX}/etc/rc.d/aether_sensord": "",
   "${PREFIX}/etc/aether-sensord.conf.sample": "",
-  "${PREFIX}/share/doc/aether-sensord/README.pf": ""
+  "${PREFIX}/share/doc/aether-sensord/README.pf": "",
+  "${PREFIX}/share/aether-sensord/appdb.cfg": "",
+  "${PREFIX}/etc/aether-sensord-policy.conf.sample": ""
 }
 EOF
 

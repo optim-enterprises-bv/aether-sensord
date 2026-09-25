@@ -238,12 +238,34 @@ bool pf_canary_ruleset_references(const char *main_rules, const char *table)
 #if defined(__FreeBSD__)
 
 /* Run a command, capturing stdout into `out`. Returns the exit status, or -1
- * if the command could not be run. */
-static int run_capture(const char *cmd, char *out, size_t out_len)
+ * if the command could not be run.
+ *
+ * ALWAYS DRAINS THE PIPE, even when `out` filled up. This is not tidiness:
+ * a reader that stops early leaves the child with unwritten output, the child
+ * dies of SIGPIPE, and pclose() then reports signal 13 rather than success.
+ * Measured on a production OPNsense firewall whose main ruleset is 13,592
+ * bytes against an 8 KB buffer: pclose() returned 13, the caller concluded it
+ * "could not check", and the enforcement canary answered INCONCLUSIVE on every
+ * run. The canary exists to answer exactly this question, so a silent
+ * degradation to "unknown" is worse than a wrong answer -- every caller that
+ * treats non-zero as "not enforced" reads it as a pass.
+ *
+ * `truncated` (optional) reports that output was discarded, so a caller can
+ * distinguish "searched the whole listing and did not find it" from "searched
+ * only the first N bytes". Concluding NOT_ENFORCED from a partial listing would
+ * be a statement about a ruleset we did not fully read.
+ */
+static int run_capture(const char *cmd, char *out, size_t out_len,
+                       bool *truncated)
 {
 	FILE *p;
 	size_t used = 0;
+	bool trunc = false;
+	char sink[4096];
+	size_t n;
 
+	if (truncated)
+		*truncated = false;
 	if (out && out_len)
 		out[0] = '\0';
 
@@ -252,15 +274,16 @@ static int run_capture(const char *cmd, char *out, size_t out_len)
 		return -1;
 
 	if (out && out_len > 1) {
-		size_t n = fread(out, 1, out_len - 1, p);
-		used = n;
+		used = fread(out, 1, out_len - 1, p);
 		out[used] = '\0';
-	} else {
-		char sink[256];
-		while (fread(sink, 1, sizeof(sink), p) > 0)
-			; /* drain, so the child never sees SIGPIPE */
 	}
 
+	/* Drain whatever is left -- including the case above where `out` filled. */
+	while ((n = fread(sink, 1, sizeof(sink), p)) > 0)
+		trunc = true;
+
+	if (truncated)
+		*truncated = trunc;
 	return pclose(p);
 }
 
@@ -275,9 +298,17 @@ static int run_capture(const char *cmd, char *out, size_t out_len)
 enum pf_canary_result pf_canary_run(const char *table, bool v6)
 {
 	char cmd[512];
-	char listing[8192];
+	/*
+	 * Sized for a real OPNsense main ruleset. It is not a nicety: when this
+	 * buffer was 8192 the listing was truncated on a production firewall
+	 * (13,592 bytes), the caller could not see the table, and the canary
+	 * degraded to INCONCLUSIVE on every run. Bigger, and `truncated` below
+	 * makes a partial read an explicit fact rather than a silent one.
+	 */
+	static char listing[512 * 1024];
 	const char *addr;
 	struct pf_canary_obs o;
+	bool truncated = false;
 	int rc;
 
 	if (!table)
@@ -288,14 +319,14 @@ enum pf_canary_result pf_canary_run(const char *table, bool v6)
 
 	/* 1. does the table exist? */
 	snprintf(cmd, sizeof(cmd), "pfctl -t %s -T show 2>/dev/null", table);
-	rc = run_capture(cmd, listing, sizeof(listing));
+	rc = run_capture(cmd, listing, sizeof(listing), NULL);
 	o.table_exists = (rc == 0);
 
 	/* 2. can the canary be added? */
 	if (o.table_exists) {
 		snprintf(cmd, sizeof(cmd), "pfctl -t %s -T add %s 2>/dev/null",
 		         table, addr);
-		rc = run_capture(cmd, NULL, 0);
+		rc = run_capture(cmd, NULL, 0, NULL);
 		o.add_accepted = (rc == 0);
 	}
 
@@ -303,7 +334,7 @@ enum pf_canary_result pf_canary_run(const char *table, bool v6)
 	 * the entry is absent is precisely the "it said it worked" failure. */
 	if (o.add_accepted) {
 		snprintf(cmd, sizeof(cmd), "pfctl -t %s -T show 2>/dev/null", table);
-		rc = run_capture(cmd, listing, sizeof(listing));
+		rc = run_capture(cmd, listing, sizeof(listing), NULL);
 		o.held_in_table = (rc == 0 && strstr(listing, addr) != NULL);
 	}
 
@@ -324,11 +355,19 @@ enum pf_canary_result pf_canary_run(const char *table, bool v6)
 			 * an unreferenced anchor, which measured 2 while the
 			 * main ruleset referenced the table zero times -- an
 			 * enforced verdict on a firewall that blocks nothing.
+			 *
+			 * A TRUNCATED listing is not evidence. "The table is
+			 * absent from the first N bytes I read" is a statement
+			 * about an unread ruleset, and reporting NOT_ENFORCED
+			 * from it would accuse a firewall on the strength of a
+			 * partial read. INCONCLUSIVE is the honest answer.
 			 */
 			snprintf(cmd, sizeof(cmd),
 			         "pfctl -s rules 2>/dev/null");
-			rc = run_capture(cmd, listing, sizeof(listing));
-			o.probe_ran = (rc == 0);
+			truncated = false;
+			rc = run_capture(cmd, listing, sizeof(listing),
+			                 &truncated);
+			o.probe_ran = (rc == 0 && !truncated);
 			o.referenced_by_rule =
 			    o.probe_ran &&
 			    pf_canary_ruleset_references(listing, table);
@@ -338,9 +377,9 @@ enum pf_canary_result pf_canary_run(const char *table, bool v6)
 	/* 5. always clean up, on every path. */
 	snprintf(cmd, sizeof(cmd), "pfctl -t %s -T delete %s 2>/dev/null",
 	         table, addr);
-	run_capture(cmd, NULL, 0);
+	run_capture(cmd, NULL, 0, NULL);
 	snprintf(cmd, sizeof(cmd), "pfctl -t %s -T show 2>/dev/null", table);
-	rc = run_capture(cmd, listing, sizeof(listing));
+	rc = run_capture(cmd, listing, sizeof(listing), NULL);
 	o.cleanup_ok = (rc == 0 && strstr(listing, addr) == NULL);
 
 	return pf_canary_classify(&o);

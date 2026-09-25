@@ -110,7 +110,6 @@ test_local_decide: test_local_decide.c ../src/local_decide.c ../src/local_decide
 		../src/policy.c ../src/sigdb.c ../src/match.c ../src/pf.c
 	$(CC) $(CFLAGS) -o $@ test_local_decide.c ../src/local_decide.c \
 		../src/policy.c ../src/sigdb.c ../src/match.c ../src/pf.c
-
 # The enforcement bridge: decisions -> pf state, driven through a fake pfctl so
 # the "pfctl lied" failure modes are reachable. Portable.
 test_local_enforce: test_local_enforce.c ../src/local_enforce.c ../src/local_enforce.h \
@@ -175,6 +174,19 @@ endif
 # LIVE tests. FreeBSD only: they build a real netgraph graph and must never be
 # run on the machine carrying your session (they create and destroy epairs).
 # They are NOT part of `check`, because `check` must be safe to run anywhere.
+#
+# test_canary_trunc belongs to this section for the pf reason, not the epair
+# one: it links the pf-backed half of canary_pf.c and drives the canary binary
+# against a stateful fake pfctl, so there is no pfctl on Linux to substitute
+# for. It is the regression for the 8192-byte listing buffer that made the
+# canary answer INCONCLUSIVE on every run against a production ruleset.
+test_canary_trunc: test/test_canary_trunc.c ../src/canary_pf.c \
+		../src/canary_pf.h ../src/canary_pf_main.c
+	$(CC) $(CFLAGS) -I../src -o test/canary_fixed \
+		../src/canary_pf.c ../src/canary_pf_main.c
+	$(CC) $(CFLAGS) -DCANARY_BIN='"$(CURDIR)/test/canary_fixed"' \
+		-o $@ test/test_canary_trunc.c
+
 live_capture_source: test/live_capture_source.c ../src/capture_source.c \
 		../src/ng_sni.c ../src/sni.c ../src/reassembly.c ../src/daemon_pf.c \
 		../src/pf.c ../src/apply_pf.c ../src/canary_pf.c ../src/feed.c \
@@ -190,7 +202,8 @@ live_capture_source: test/live_capture_source.c ../src/capture_source.c \
 
 clean:
 	rm -f $(BINS) $(LINUX_BINS) test_dpi test_appblock dpi_replay \
-		live_capture_source live_attach live_ng_sni
+		live_capture_source live_attach live_ng_sni \
+		test_canary_trunc test/canary_fixed
 
 test_flowlog: test_flowlog.c ../src/flowlog.c ../src/appblock.c ../src/match.c ../src/sigdb.c ../src/observe.c ../src/afpush.c ../src/policy.c
 	$(CC) $(CFLAGS) -o $@ test_flowlog.c ../src/flowlog.c ../src/appblock.c ../src/match.c ../src/sigdb.c ../src/observe.c ../src/afpush.c ../src/policy.c

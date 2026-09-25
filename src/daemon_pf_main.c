@@ -28,9 +28,14 @@
  * whole project rests on "it is running" not being evidence of anything.
  */
 
+#include "capture_source.h"
 #include "daemon_pf.h"
 
 #include "canary_pf.h"
+#include "local_decide.h"
+#include "polcfg.h"
+#include "policy.h"
+#include "sigdb.h"
 #include "feed.h"
 
 #include <errno.h>
@@ -138,6 +143,11 @@ int main(int argc, char **argv)
 	struct dpf_config cfg;
 	struct pf_apply_ctx ap;
 	struct feed_client fc;
+	struct capture_source *cs = NULL;
+	struct sig_db db;
+	struct pol_db pol;
+	struct polcfg_stats pcs;
+	unsigned n_local_checked = 0;
 	const char *config_path = DEFAULT_CONFIG;
 	bool once = false;
 	bool check_only = false;
@@ -161,6 +171,10 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+
+	sig_db_init(&db);
+	pol_db_init(&pol);
+	memset(&pcs, 0, sizeof pcs);
 
 	dpf_config_defaults(&cfg);
 	cr = dpf_config_load(&cfg, config_path, &line);
@@ -190,6 +204,18 @@ int main(int argc, char **argv)
 	if (!once)
 		openlog("aether-sensord-pf", LOG_PID, LOG_DAEMON);
 
+	/*
+	 * SIGPIPE MUST BE IGNORED.
+	 *
+	 * A netgraph control-socket write to a graph that has gone away raises
+	 * SIGPIPE, whose default action kills the process WITHOUT any output.
+	 * For this daemon that means a transient error terminates the thing that
+	 * is supposed to be enforcing, and the machine reports enforcement right
+	 * up to the moment it stopped. Measured rc=141 (128+13) with an empty
+	 * log.
+	 */
+	signal(SIGPIPE, SIG_IGN);
+
 	pf_apply_ctx_init(&ap, pf_apply_exec_posix, NULL);
 	feed_client_init(&fc);
 
@@ -198,6 +224,74 @@ int main(int argc, char **argv)
 		 * must not sit there looking healthy. */
 		if (!cfg.tolerant)
 			return 1;
+	}
+
+	/*
+	 * THE LOCAL CAPTURE SOURCE, when configured.
+	 *
+	 * Held open across passes on purpose: the reassembly table lives in the
+	 * capture handle, and reopening it every pass would reset the state and
+	 * make every multi-segment ClientHello unparseable. That is the same
+	 * class of bug already fixed once in the transport layer.
+	 *
+	 * NULL means capture is off OR it could not attach. The two are told
+	 * apart below, because "capture is not configured" and "capture is
+	 * configured and broken" must not look the same in the log.
+	 */
+	if (cfg.capture_iface[0] != '\0' && cfg.table_local[0] != '\0') {
+		cs = capture_source_open(cfg.capture_iface);
+		if (!cs) {
+			syslog(LOG_ERR, "capture: cannot attach to %s -- local "
+			       "blocking is NOT running", cfg.capture_iface);
+			if (!cfg.tolerant)
+				return 1;
+		} else if (!capture_source_is_healthy(cs)) {
+			/*
+			 * Wired but not passing: on a real interface this is the
+			 * failure that cannot be recovered remotely, because the
+			 * interface is out of the kernel's path.
+			 */
+			syslog(LOG_CRIT, "capture: %s attached but NOT passing "
+			       "traffic (reinjection failed) -- tearing down",
+			       cfg.capture_iface);
+			capture_source_close(cs);
+			cs = NULL;
+			if (!cfg.tolerant)
+				return 1;
+		} else {
+			syslog(LOG_INFO, "capture: attached to %s, table=%s "
+			       "enforce=%s", cfg.capture_iface, cfg.table_local,
+			       cfg.capture_enforce ? "yes" : "no (observe)");
+		}
+	}
+
+	/*
+	 * The signature database and policy are loaded ONCE. A policy file that
+	 * will not parse is a fault, not an empty policy -- an empty policy
+	 * silently allows everything while looking configured.
+	 */
+	if (cs) {
+		if (sig_db_load_path(&db, cfg.sigdb_path) <= 0) {
+			syslog(LOG_ERR, "capture: cannot load signature db %s",
+			       cfg.sigdb_path);
+			capture_source_close(cs);
+			cs = NULL;
+			if (!cfg.tolerant)
+				return 1;
+		} else if (polcfg_load_file(&pol, &db, cfg.policy_path,
+		                            &pcs) < 0) {
+			syslog(LOG_ERR, "capture: cannot load policy %s -- "
+			       "refusing to run local blocking with no policy",
+			       cfg.policy_path);
+			capture_source_close(cs);
+			cs = NULL;
+			if (!cfg.tolerant)
+				return 1;
+		} else {
+			syslog(LOG_INFO, "capture: %zu signature apps, %zu "
+			       "subjects, %zu rules", db.n_apps, pol.n_subjects,
+			       pol.n_rules);
+		}
 	}
 
 	if (check_only) {
@@ -216,10 +310,58 @@ int main(int argc, char **argv)
 
 	do {
 		struct dpf_pass_stats st;
+		struct dpf_local_stats lst;
 		int applied = dpf_run_pass(&cfg, &ap, &fc, &st);
+		int n_local;
 
 		if (applied < 0) {
 			syslog(LOG_ERR, "spool pass failed");
+			if (!cfg.tolerant)
+				return 1;
+		}
+
+		/*
+		 * THE LOCAL HALF OF THE PASS.
+		 *
+		 * This runs every interval and is the whole point of the local
+		 * path: traffic seen on this device becomes a pf decision without
+		 * waiting for a remote feed to say anything. Runs with cs == NULL
+		 * when capture is not configured, which dpf_run_local reports as
+		 * skipped rather than as zero flows.
+		 */
+		n_local = dpf_run_local(&cfg, &ap, cs ? &db : NULL,
+		                        cs ? &pol : NULL, capture_source_drain,
+		                        cs, &lst);
+
+		/*
+		 * A negative return with a configured capture is a FAULT, and on
+		 * a firewall it must not be quietly absorbed: the daemon would
+		 * keep reporting healthy counters while blocking nothing. The
+		 * `tolerant` posture decides whether it is fatal, exactly as for
+		 * a failed feed apply.
+		 */
+		if (n_local < 0 && cs) {
+			syslog(LOG_ERR, "local pass failed (flows=%u decided=%u "
+			       "applied=%u failed=%u)", lst.flows, lst.decided,
+			       lst.applied, lst.failed);
+			if (!cfg.tolerant)
+				return 1;
+		}
+
+		/*
+		 * PERIODIC HEALTH CHECK on the capture, and it is not optional.
+		 *
+		 * A capture that has silently stopped passing traffic and one with
+		 * nothing to say produce the same zero verdicts. On a real
+		 * interface the failure this catches is the one that cannot be
+		 * recovered remotely, because the interface is out of the kernel's
+		 * path and the session used it.
+		 */
+		if (cs && (++n_local_checked % 12u == 0u) &&
+		    !capture_source_is_healthy(cs)) {
+			syslog(LOG_CRIT, "capture: %s is no longer passing traffic "
+			       "-- local blocking has stopped",
+			       cfg.capture_iface);
 			if (!cfg.tolerant)
 				return 1;
 		}
@@ -231,6 +373,18 @@ int main(int argc, char **argv)
 			       "failed=%u retained=%u\n",
 			       st.seen, st.applied, st.stale, st.resync,
 			       st.unusable, st.failed, st.retained);
+			/*
+			 * The local half is reported SEPARATELY and always, even
+			 * when capture is off. Folding it into the feed numbers
+			 * would make "the fed applied 40 prefixes" and "the
+			 * capture blocked 2 destinations" the same sentence, and
+			 * an operator could not tell which half blocked what.
+			 */
+			printf("local: available=%u flows=%u decided=%u "
+			       "applied=%u failed=%u truncated=%u skipped=%u\n",
+			       lst.available, lst.flows, lst.decided,
+			       lst.applied, lst.failed, lst.truncated,
+			       lst.skipped);
 			if (st.failed > 0 && !cfg.tolerant)
 				return 1;
 			return 0;

@@ -57,3 +57,40 @@ canary = on
 # investigated. Set to on only where a supervision layer reports the failure.
 # [default: off]
 tolerant = off
+
+# ---------------------------------------------------------------------------
+# LOCAL CAPTURE — act on what THIS device sees, without waiting for the feed.
+#
+# The reputation feed is the controller telling this device what to block.
+# These settings are the other direction: traffic seen here, matched against a
+# local signature database and policy, turned into pf table entries. The two are
+# independent; the feed works with capture off, and vice versa.
+#
+# DEFAULT IS OFF, and that is deliberate. Enabling this is the only setting here
+# that can interrupt traffic, because it reattaches a live interface.
+#
+# capture_iface      Interface to capture on. NEVER the one carrying your
+#                    management session — the attach temporarily takes the
+#                    interface out of the kernel's path, and a failure between
+#                    detach and reattach takes that session with it.
+# capture_enforce    no  = observe: run the whole pipeline, decide, write NOTHING
+#                    yes = apply the decisions to the table below
+#                    Start with `no`. `decided` > 0 with `applied` = 0 is observe
+#                    mode working correctly.
+# table_local        pf table for locally-detected destinations. DELIBERATELY
+#                    SEPARATE from `table` (feed reputation): a feed prefix is a
+#                    considered judgement that can persist for hours, while a
+#                    local detection is one observation of one destination and
+#                    should expire quickly. One table cannot have both lifetimes.
+#                    Must be registered as an OPNsense static alias, or the
+#                    elements will be listed and nothing blocked.
+# sigdb_path         Signature database (shipped as appdb.cfg).
+# policy_path        Subjects and rules. Ships with none, which blocks nothing —
+#                    write a policy before enabling enforcement.
+#
+# capture_iface    = igb2
+# table_local      = aisense_local4
+# capture_enforce  = no
+# capture_max_flows = 256
+# sigdb_path       = /usr/local/share/aether-sensord/appdb.cfg
+# policy_path      = /usr/local/etc/aether-sensord-policy.conf
