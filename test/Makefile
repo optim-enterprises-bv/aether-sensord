@@ -1,6 +1,7 @@
 # Host-side unit tests. No OpenWrt toolchain, no device, no nDPI.
 CFLAGS ?= -std=gnu11 -Wall -Wextra -Werror -O1 -g -D_GNU_SOURCE
 BINS = test_sigdb test_policy test_nft test_feed test_apply test_afpush \
+       test_sni test_reassembly \
        test_observe test_nflog_raw test_polcfg test_neigh test_offload test_canary test_flowlog
 .PHONY: all check clean
 all: check
@@ -34,6 +35,14 @@ test_offload: test_offload.c ../src/offload.c ../src/apply.c ../src/nft.c
 
 test_neigh: test_neigh.c ../src/neigh.c ../src/observe.c ../src/neigh.h
 	$(CC) $(CFLAGS) -o $@ test_neigh.c ../src/neigh.c ../src/observe.c
+
+# SNI extraction and TCP reassembly: the FreeBSD/OPNsense port's new parsing
+# layer. See the freebsd-payload-filtering skill for why these exist.
+test_sni: test_sni.c ../src/sni.c ../src/sni.h
+	$(CC) $(CFLAGS) -o $@ test_sni.c ../src/sni.c
+
+test_reassembly: test_reassembly.c ../src/reassembly.c ../src/reassembly.h ../src/sni.c
+	$(CC) $(CFLAGS) -o $@ test_reassembly.c ../src/reassembly.c ../src/sni.c
 
 test_polcfg: test_polcfg.c ../src/polcfg.c ../src/policy.c ../src/sigdb.c ../src/polcfg.h
 	$(CC) $(CFLAGS) -o $@ test_polcfg.c ../src/polcfg.c ../src/policy.c ../src/sigdb.c
