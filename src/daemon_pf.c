@@ -459,10 +459,29 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 		return;
 	}
 
-	if (msg.rejected || msg.overflowed)
+	if (msg.rejected || msg.overflowed) {
+		/*
+		 * States the CAP, and the received count per class.
+		 *
+		 * "N over capacity" alone does not say which class was cut, nor where
+		 * the limit is -- measured, a 1683-entry advisory class printed
+		 * "1171 over capacity" and nothing else, which reads as a generic feed
+		 * problem rather than "the advisory class is capped at 512".
+		 *
+		 * `overflowed` counts the whole payload, not one class: the wire array
+		 * is bounded PER CLASS (FEED_MAX_ELEMS each), so a single total cannot
+		 * attribute the cut. The per-class numbers printed here are what
+		 * ARRIVED, so an operator can see which class sits at the cap and
+		 * compare against the controller's own stated drop.
+		 */
 		syslog(LOG_WARNING,
-		       "feed serial %llu: %u elements refused, %u over capacity",
-		       (unsigned long long)msg.serial, msg.rejected, msg.overflowed);
+		       "feed serial %llu: %u elements refused, %u over capacity "
+		       "(cap %d per class; received add=%zu remove=%zu advisory=%zu "
+		       "local=%zu local_remove=%zu)",
+		       (unsigned long long)msg.serial, msg.rejected, msg.overflowed,
+		       (int)FEED_MAX_ELEMS, msg.n_add, msg.n_remove, msg.n_advisory,
+		       msg.n_local, msg.n_local_remove);
+	}
 
 	o = feed_client_accept(fc, &msg);
 	switch (o) {
