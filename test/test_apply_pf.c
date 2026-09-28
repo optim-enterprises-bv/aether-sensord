@@ -591,6 +591,153 @@ static void test_degenerate_inputs(void)
 	CHECK(pf_table_lists_elem(NULL, &e) == false, "NULL listing");
 }
 
+static void test_a_batch_larger_than_one_invocation_is_chunked(void)
+{
+	/*
+	 * THE BUG THIS PINS. `run_table_op` clamped n to PF_BATCH_MAX and
+	 * returned success, so elements past the bound were never sent while the
+	 * caller believed they were. `pf_apply_and_verify` then walked all n and
+	 * failed with "element ... not present after apply", forever.
+	 *
+	 * Measured on the appliance: a 512-element class left exactly 256
+	 * addresses in `aisense_feed4` (256 == PF_BATCH_MAX), and a 1683-element
+	 * class reported "1171 over capacity".
+	 */
+	struct fake f;
+	struct pf_apply_ctx c;
+	static struct pf_elem e[PF_BATCH_MAX + 10];
+	char err[512];
+	size_t n = PF_BATCH_MAX + 10;
+
+	fake_init(&f);
+	f.ruleset = "block drop from <aisense_rep4> to any\n";
+	pf_apply_ctx_init(&c, fake_exec, &f);
+
+	for (size_t i = 0; i < n; i++) {
+		char text[32];
+		/* 266 elements need two octets: 192.0.2.1 .. 192.0.2.255 then
+		 * 198.51.100.1 .. -- both TEST-NET, and every address valid. */
+		if (i < 255)
+			snprintf(text, sizeof(text), "192.0.2.%zu/32", i + 1);
+		else
+			snprintf(text, sizeof(text), "198.51.100.%zu/32", i - 254);
+		CHECK(pf_elem_parse(text, 0, &e[i]) == PF_OK, "parse");
+	}
+
+	CHECK(pf_apply_add(&c, "aisense_rep4", e, n, err, sizeof(err)) ==
+	      PF_APPLY_OK, "a batch past one invocation still applies");
+
+	/* Both invocations must have happened: the fake appends what it is
+	 * handed, so the mutable listing must hold every element. */
+	{
+		char listing[4096];
+		CHECK(pf_apply_show(&c, "aisense_rep4", listing, sizeof(listing)) > 0,
+		      "table readable");
+		for (size_t i = 0; i < n; i++) {
+			char text[32];
+			if (i < 255)
+				snprintf(text, sizeof(text), "192.0.2.%zu/32", i + 1);
+			else
+				snprintf(text, sizeof(text), "198.51.100.%zu/32",
+				         i - 254);
+			if (!strstr(listing, text)) {
+				CHECK(false, "every element reached pf");
+				break;
+			}
+		}
+		CHECK(c.applied_batches == 2,
+		      "counted as two invocations, not one clamped one");
+	}
+}
+
+static void test_the_batch_bound_refuses_rather_than_truncates(void)
+{
+	/*
+	 * The direct statement of the rule: a single invocation must REFUSE
+	 * rather than silently send a prefix. Truncation is invisible; refusal
+	 * is not.
+	 */
+	struct fake f;
+	struct pf_apply_ctx c;
+	static struct pf_elem e[PF_BATCH_MAX + 1];
+	char err[512];
+
+	fake_init(&f);
+	pf_apply_ctx_init(&c, fake_exec, &f);
+	for (size_t i = 0; i <= PF_BATCH_MAX; i++)
+		CHECK(pf_elem_parse("192.0.2.1/32", 0, &e[i]) == PF_OK, "parse");
+
+	/* Via the single-invocation entry point, the bound is enforced by
+	 * refusal -- the chunking wrapper is what makes a larger set legal. */
+	CHECK(pf_apply_add_batch(&c, "aisense_rep4", e, PF_BATCH_MAX + 1, err,
+	                         sizeof(err)) == PF_APPLY_REJECTED,
+	      "an oversized single invocation is refused, not truncated");
+	CHECK(strstr(err, "chunk") != NULL ||
+	      strstr(err, "batch bound") != NULL,
+	      "and the error says the caller must chunk");
+}
+
+static void test_an_advisory_table_needs_no_rule(void)
+{
+	/*
+	 * THE FALSE ALARM THIS PINS. The advisory class is uncorroborated by
+	 * design and is deliberately not enforced, so no rule may reference its
+	 * table -- measured: `aisense_feed4` appears ZERO times in
+	 * `pfctl -s rules`. Verification that demanded a rule reference failed
+	 * on every pass with "element ... not present in table aisense_feed4
+	 * after apply" against a table that was being written correctly.
+	 */
+	struct fake f;
+	struct pf_apply_ctx c;
+	struct pf_elem e;
+	char err[512];
+
+	fake_init(&f);
+	f.add_is_a_noop = false;
+	f.ruleset = "pass all\npass quick on lo0\n"; /* no reference to the table */
+
+	pf_apply_ctx_init(&c, fake_exec, &f);
+	CHECK(pf_elem_parse("77.91.119.0/24", 0, &e) == PF_OK, "parse");
+
+	CHECK(pf_apply_and_verify_advisory(&c, "aisense_feed4", &e, 1, err,
+	                                   sizeof(err)),
+	      "an advisory table verifies on membership alone");
+	CHECK(c.unreferenced_tables == 0,
+	      "and is NOT counted as an unreferenced-table failure");
+
+	/* But the ENFORCED check must still refuse the same table: that is the
+	 * whole point of having two. */
+	fake_init(&f);
+	f.ruleset = "pass all\npass quick on lo0\n";
+	pf_apply_ctx_init(&c, fake_exec, &f);
+	CHECK(pf_elem_parse("77.91.119.0/24", 0, &e) == PF_OK, "parse again");
+	CHECK(!pf_apply_and_verify(&c, "aisense_feed4", &e, 1, err, sizeof(err)),
+	      "the enforced check still requires a rule reference");
+	CHECK(c.unreferenced_tables == 1, "and counts it as unreferenced");
+}
+
+static void test_flush_on_an_absent_table_is_recognised(void)
+{
+	/*
+	 * `pfctl -t <absent> -T flush` reports "Operation not supported by
+	 * device" and exits 255 -- measured. Before this was matched, the first
+	 * flush of a snapshot (which runs before any add creates the table) was
+	 * logged as an unexplained warning.
+	 */
+	struct fake f;
+	struct pf_apply_ctx c;
+	char err[256];
+
+	fake_init(&f);
+	f.status = 255;
+	f.show_output = "pfctl: Operation not supported by device\n";
+	pf_apply_ctx_init(&c, fake_exec, &f);
+
+	CHECK(pf_apply_flush(&c, "aisense_feed4", err, sizeof(err)) ==
+	      PF_APPLY_UNAVAILABLE, "an absent table is UNAVAILABLE on flush");
+	CHECK(c.missing_table == 1, "and counted as a missing table");
+}
+
 int main(void)
 {
 	test_table_name_validation();
@@ -611,6 +758,10 @@ int main(void)
 	test_membership_does_not_confuse_v4_and_v6();
 	test_pf_adapter_admits_the_element_and_records_the_gap();
 	test_degenerate_inputs();
+	test_a_batch_larger_than_one_invocation_is_chunked();
+	test_the_batch_bound_refuses_rather_than_truncates();
+	test_an_advisory_table_needs_no_rule();
+	test_flush_on_an_absent_table_is_recognised();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;

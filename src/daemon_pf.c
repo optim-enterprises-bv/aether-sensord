@@ -546,9 +546,14 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 		 * regression, and it is already in place and verified. Nothing is
 		 * blocked on this table unless an operator has written a rule
 		 * against it.
+		 *
+		 * The ADVISORY verifier is used, not the enforced one: this class
+		 * is uncorroborated by design and no rule references its table, so
+		 * the rule check would fail it on every pass.
 		 */
-		if (!pf_apply_and_verify(ap, adv, msg.advisory, msg.n_advisory, err,
-		                         sizeof(err)))
+		if (!pf_apply_and_verify_advisory(ap, adv, msg.advisory,
+		                                  msg.n_advisory, err,
+		                                  sizeof(err)))
 			syslog(LOG_WARNING,
 			       "feed serial %llu: advisory class not applied to "
 			       "%s: %s",

@@ -122,6 +122,18 @@ enum pf_apply_result pf_apply_add(struct pf_apply_ctx *c, const char *table,
                                   const struct pf_elem *elems, size_t n,
                                   char *err, size_t err_len);
 
+/*
+ * One pfctl invocation, no chunking. Refuses (rather than truncates) a set
+ * larger than PF_BATCH_MAX.
+ *
+ * Exposed for two reasons: a test can state the bound directly, and a caller
+ * that does its own chunking can opt out of ours. Normal callers want
+ * `pf_apply_add`, which chunks transparently.
+ */
+enum pf_apply_result pf_apply_add_batch(struct pf_apply_ctx *c, const char *table,
+                                        const struct pf_elem *elems, size_t n,
+                                        char *err, size_t err_len);
+
 enum pf_apply_result pf_apply_del(struct pf_apply_ctx *c, const char *table,
                                   const struct pf_elem *elems, size_t n,
                                   char *err, size_t err_len);
@@ -227,6 +239,21 @@ bool pf_apply_ruleset_references(const char *main_rules, const char *table);
 bool pf_apply_and_verify(struct pf_apply_ctx *c, const char *table,
                          const struct pf_elem *elems, size_t n, char *err,
                          size_t err_len);
+
+/*
+ * The same, for the ADVISORY class -- which is not enforced by definition, so
+ * requiring a rule reference would fail it forever. Membership is still
+ * required; the rule check is skipped.
+ *
+ * Measured on the appliance: `aisense_feed4` appears ZERO times in
+ * `pfctl -s rules` while `aisense_local4` appears 4 times and `aisense_rep4`
+ * once. Running the enforced check on the advisory table produced
+ * "element ... not present in table aisense_feed4 after apply" on every pass
+ * against a table that was being written correctly.
+ */
+bool pf_apply_and_verify_advisory(struct pf_apply_ctx *c, const char *table,
+                                  const struct pf_elem *elems, size_t n,
+                                  char *err, size_t err_len);
 
 /* The real exec, used in production. Not used by tests. */
 int pf_apply_exec_posix(const char *argv0, const char *const *argv, char *out,

@@ -92,14 +92,38 @@ static bool output_says_missing_table(const char *s)
 {
 	if (!s)
 		return false;
+	/*
+	 * Two texts, both measured on the appliance (FreeBSD 15.1, pfctl from
+	 * OPNsense 26.7.2_2):
+	 *
+	 *   pfctl -t <absent> -T show   -> "pfctl: Table does not exist."
+	 *   pfctl -t <absent> -T flush  -> "pfctl: Operation not supported by
+	 *                                  device"
+	 *
+	 * The flush wording is a lie about the cause -- the device is fine, the
+	 * table is not there -- and it matters because `flush` is the FIRST
+	 * thing a snapshot does. Without matching it, the first flush after a
+	 * boot was logged as an unexplained warning and the advisory table was
+	 * left as it was, on a table that a preceding `-T add` had not yet
+	 * created.
+	 *
+	 * Note both exit 255, so the text is the only signal available.
+	 */
 	return strstr(s, "does not exist") != NULL ||
-	       strstr(s, "Table does not exist") != NULL;
+	       strstr(s, "Operation not supported by device") != NULL;
 }
 
-static enum pf_apply_result run_table_op(struct pf_apply_ctx *c,
-                                         const char *table, const char *verb,
-                                         const struct pf_elem *elems, size_t n,
-                                         char *err, size_t err_len)
+static bool pf_apply_and_verify_impl(struct pf_apply_ctx *c, const char *table,
+                                     const struct pf_elem *elems, size_t n,
+                                     bool require_rule, char *err,
+                                     size_t err_len);
+
+static enum pf_apply_result run_table_op_batch(struct pf_apply_ctx *c,
+                                               const char *table,
+                                               const char *verb,
+                                               const struct pf_elem *elems,
+                                               size_t n, char *err,
+                                               size_t err_len)
 {
 	/*
 	 * argv is built on the heap: a feed batch can carry PF_BATCH_MAX
@@ -122,8 +146,27 @@ static enum pf_apply_result run_table_op(struct pf_apply_ctx *c,
 		return PF_APPLY_UNAVAILABLE;
 	if (!pf_table_name_ok(table))
 		return PF_APPLY_BAD_TABLE;
-	if (n > PF_BATCH_MAX)
-		n = PF_BATCH_MAX;
+	/*
+	 * NEVER TRUNCATE. An earlier version clamped n to PF_BATCH_MAX here and
+	 * returned success, so everything past the bound was silently not sent
+	 * while the caller believed it was. `pf_apply_and_verify` checks every
+	 * element it was handed, so the dropped tail came back as "element
+	 * ... not present after apply" on every pass, forever. Measured on the
+	 * appliance: a 512-element advisory class left exactly 256
+	 * (= PF_BATCH_MAX) addresses in the table, and 1683-element class left
+	 * 1171 counted as "over capacity".
+	 *
+	 * The bound belongs to one INVOCATION, not one update; callers chunk
+	 * via run_table_op_all. Refusing here is visible, truncating is not.
+	 */
+	if (n > PF_BATCH_MAX) {
+		if (err && err_len)
+			snprintf(err, err_len,
+			         "%zu elements exceed the %d-element batch bound "
+			         "-- the caller must chunk, not truncate",
+			         n, (int)PF_BATCH_MAX);
+		return PF_APPLY_REJECTED;
+	}
 
 	cap = 5 + n + 1;
 	argv = calloc(cap, sizeof(*argv));
@@ -198,6 +241,62 @@ static enum pf_apply_result run_table_op(struct pf_apply_ctx *c,
 	return r;
 }
 
+/*
+ * Run `verb` over `n` elements, in PF_BATCH_MAX-sized invocations.
+ *
+ * WHY THIS EXISTS. PF_BATCH_MAX bounds ONE pfctl invocation: the argument list
+ * must fit in ARG_MAX, and a very long argv is also how a table operation turns
+ * into an E2BIG. It is not a statement about how many elements an update may
+ * carry -- the parser admits FEED_MAX_ELEMS (512) and the controller is free to
+ * publish more than that across classes.
+ *
+ * The first version of this file clamped instead, which meant a 512-element
+ * advisory class put exactly 256 addresses in the table and reported success,
+ * while `pf_apply_and_verify` then demanded all 512 and failed. Measured on the
+ * appliance: 256 in `aisense_feed4`, and "1171 over capacity" for a 1683-element
+ * class. Chunking is the fix that makes the bound invisible to callers.
+ *
+ * NOT ATOMIC, deliberately: partial application is possible if invocation 3 of
+ * 4 fails. That is strictly better than the alternative the caller faces -- a
+ * truncated table that claims to be complete. The failure is returned with the
+ * count that landed, so it is reportable.
+ */
+static enum pf_apply_result run_table_op(struct pf_apply_ctx *c,
+                                         const char *table, const char *verb,
+                                         const struct pf_elem *elems, size_t n,
+                                         char *err, size_t err_len)
+{
+	size_t off = 0;
+
+	if (n <= PF_BATCH_MAX)
+		return run_table_op_batch(c, table, verb, elems, n, err, err_len);
+
+	while (off < n) {
+		size_t chunk = n - off;
+		enum pf_apply_result r;
+
+		if (chunk > PF_BATCH_MAX)
+			chunk = PF_BATCH_MAX;
+
+		r = run_table_op_batch(c, table, verb, elems + off, chunk, err,
+		                       err_len);
+		if (r != PF_APPLY_OK) {
+			if (err && err_len && err[0]) {
+				char tail[128];
+				snprintf(tail, sizeof(tail),
+				         " (element %zu of %zu; %zu applied "
+				         "across %zu invocation(s))",
+				         off, n, off, off / PF_BATCH_MAX);
+				strncat(err, tail, err_len - strlen(err) - 1);
+			}
+			return r;
+		}
+		off += chunk;
+	}
+
+	return PF_APPLY_OK;
+}
+
 enum pf_apply_result pf_apply_add(struct pf_apply_ctx *c, const char *table,
                                   const struct pf_elem *elems, size_t n,
                                   char *err, size_t err_len)
@@ -205,6 +304,19 @@ enum pf_apply_result pf_apply_add(struct pf_apply_ctx *c, const char *table,
 	if (!elems)
 		return PF_APPLY_REJECTED;
 	return run_table_op(c, table, "add", elems, n, err, err_len);
+}
+
+/*
+ * One invocation, no chunking. Exposed so a test can state the bound directly,
+ * and so a caller that has its own chunking can opt out of ours.
+ */
+enum pf_apply_result pf_apply_add_batch(struct pf_apply_ctx *c, const char *table,
+                                        const struct pf_elem *elems, size_t n,
+                                        char *err, size_t err_len)
+{
+	if (!elems)
+		return PF_APPLY_REJECTED;
+	return run_table_op_batch(c, table, "add", elems, n, err, err_len);
 }
 
 enum pf_apply_result pf_apply_del(struct pf_apply_ctx *c, const char *table,
@@ -419,6 +531,50 @@ bool pf_apply_and_verify(struct pf_apply_ctx *c, const char *table,
                          const struct pf_elem *elems, size_t n, char *err,
                          size_t err_len)
 {
+	/*
+	 * Delegates, with the rule-reference requirement ON.
+	 *
+	 * That requirement is the check that matters for an ENFORCED class: a
+	 * table holding an address drops nothing unless a rule names it, so
+	 * "the elements are present" alone would report protection nobody has.
+	 */
+	return pf_apply_and_verify_impl(c, table, elems, n, true, err, err_len);
+}
+
+bool pf_apply_and_verify_advisory(struct pf_apply_ctx *c, const char *table,
+                                  const struct pf_elem *elems, size_t n,
+                                  char *err, size_t err_len)
+{
+	/*
+	 * The advisory class is BY DEFINITION uncorroborated: prefixes a vetted
+	 * feed named and no sensor of ours has seen. It is deliberately NOT
+	 * enforced, so no rule may reference it, and the rule-reference check
+	 * that makes `pf_apply_and_verify` meaningful for an enforced class
+	 * makes this one permanently unverifiable.
+	 *
+	 * Measured: `aisense_feed4` appears ZERO times in `pfctl -s rules`
+	 * (`aisense_local4` 4, `aisense_rep4` 1). Running the enforced check
+	 * here produced "element 77.91.119.0/24 not present in table
+	 * aisense_feed4 after apply" on every pass, on a table that was being
+	 * written correctly -- a false alarm that would train an operator to
+	 * ignore the one message that matters.
+	 *
+	 * So membership is required and the rule reference is not. That is not
+	 * a weakening for this class: nothing is supposed to be dropped on it.
+	 */
+	return pf_apply_and_verify_impl(c, table, elems, n, false, err, err_len);
+}
+/*
+ * The shared body. `require_rule` is the one thing the two classes disagree on:
+ * an enforced table is only enforced because a rule names it, while an advisory
+ * table is not enforced at all -- so demanding a rule reference there fails a
+ * correct table forever.
+ */
+static bool pf_apply_and_verify_impl(struct pf_apply_ctx *c, const char *table,
+                                     const struct pf_elem *elems, size_t n,
+                                     bool require_rule, char *err,
+                                     size_t err_len)
+{
 	char listing[16384];
 	char rules[65536];
 	enum pf_apply_result r;
@@ -456,27 +612,33 @@ bool pf_apply_and_verify(struct pf_apply_ctx *c, const char *table,
 	}
 
 	/*
-	 * THE CHECK THAT MATTERS. Elements being present says pf holds them; it
-	 * does not say anything will be dropped, because `-T add` creates an
-	 * undeclared table rather than failing. So require a rule in the main
-	 * ruleset to reference it.
+	 * THE CHECK THAT MATTERS for an ENFORCED table. Elements being present
+	 * says pf holds them; it does not say anything will be dropped, because
+	 * `-T add` creates an undeclared table rather than failing. So require a
+	 * rule in the main ruleset to reference it.
+	 *
+	 * Skipped for the advisory class, which is not enforced by design and
+	 * therefore has no rule -- see pf_apply_and_verify_advisory.
 	 */
-	if (pf_apply_ruleset(c, rules, sizeof(rules)) < 0) {
-		c->failed_batches++;
-		if (err && err_len)
-			snprintf(err, err_len, "cannot read the pf ruleset");
-		return false;
-	}
+	if (require_rule) {
+		if (pf_apply_ruleset(c, rules, sizeof(rules)) < 0) {
+			c->failed_batches++;
+			if (err && err_len)
+				snprintf(err, err_len, "cannot read the pf ruleset");
+			return false;
+		}
 
-	if (!pf_apply_ruleset_references(rules, table)) {
-		c->unreferenced_tables++;
-		if (err && err_len)
-			snprintf(err, err_len,
-			         "table %s holds the elements but NO RULE in the "
-			         "main ruleset references it -- nothing will be "
-			         "dropped. Register it as an OPNsense static alias.",
-			         table);
-		return false;
+		if (!pf_apply_ruleset_references(rules, table)) {
+			c->unreferenced_tables++;
+			if (err && err_len)
+				snprintf(err, err_len,
+				         "table %s holds the elements but NO RULE in "
+				         "the main ruleset references it -- nothing "
+				         "will be dropped. Register it as an OPNsense "
+				         "static alias.",
+				         table);
+			return false;
+		}
 	}
 
 	return true;
