@@ -85,7 +85,21 @@ static inline int feed_elem_set_timeout(struct nft_elem *e, uint32_t t)
  */
 #define FEED_MISSING_LIMIT 10
 
-/* Elements carried in one message. Bounded; overflow is counted, not written. */
+/*
+ * Elements carried in one message, PER CLASS. Bounded; overflow is counted, not
+ * written.
+ *
+ * This bound is duplicated in another repository and nothing enforces that the
+ * two agree: the controller's advisory cap is `ADVISORY_MAX_ENTRIES` in
+ * `aether/crates/nemesis/src/distribute.rs`. Both are 512, deliberately -- the
+ * controller cuts the advisory class to this number so the class arrives whole
+ * instead of being truncated on the wire. If either moves without the other the
+ * class is silently cut again: lower this alone and the controller's 512 are
+ * dropped on arrival while its own report claims they were published.
+ *
+ * One stated definition, duplicated on purpose -- change both, and the WARN text
+ * in daemon_pf.c with them.
+ */
 #define FEED_MAX_ELEMS 512
 
 enum feed_msg_type { FEED_MSG_NONE = 0, FEED_MSG_DELTA, FEED_MSG_LIST };
