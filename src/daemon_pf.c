@@ -48,6 +48,8 @@ void dpf_config_defaults(struct dpf_config *cfg)
 	 */
 	snprintf(cfg->spool_dir, sizeof(cfg->spool_dir), "/var/spool/aether/in");
 	snprintf(cfg->table, sizeof(cfg->table), "%s", PF_TABLE_NAME_DEFAULT);
+	snprintf(cfg->table_advisory, sizeof(cfg->table_advisory), "%s",
+	         PF_TABLE_NAME_ADVISORY_DEFAULT);
 	snprintf(cfg->table_v6, sizeof(cfg->table_v6), "aisense_rep6");
 	cfg->interval_sec = 5;
 	snprintf(cfg->spool_out, sizeof(cfg->spool_out), "/var/spool/aether/out");
@@ -213,6 +215,19 @@ enum dpf_cfg_result dpf_config_parse(struct dpf_config *cfg, const char *text,
 		} else if (strcmp(key, "table") == 0) {
 			if (!copy_bounded(cfg->table, sizeof(cfg->table), val))
 				goto bad;
+		} else if (strcmp(key, "table_advisory") == 0) {
+			/*
+			 * An explicitly empty value disables the advisory class rather
+			 * than being read as "unset and use the default" -- the same
+			 * convention `table_v6` uses. Copying "" with copy_bounded would
+			 * fail on a zero-length string, so this is handled before it.
+			 */
+			if (val[0] == '\0') {
+				cfg->table_advisory[0] = '\0';
+			} else if (!copy_bounded(cfg->table_advisory,
+			                         sizeof(cfg->table_advisory), val)) {
+				goto bad;
+			}
 		} else if (strcmp(key, "table_v6") == 0) {
 			if (!copy_bounded(cfg->table_v6, sizeof(cfg->table_v6), val))
 				goto bad;
@@ -329,6 +344,11 @@ bool dpf_config_can_enforce(const struct dpf_config *cfg)
 		return false;
 	if (cfg->spool_dir[0] == '\0')
 		return false;
+	/* The advisory table is optional, but if it is set it must be a name pf
+	 * will accept: a silently rejected name reads as "the class is empty". */
+	if (cfg->table_advisory[0] != '\0' &&
+	    !pf_table_name_ok(cfg->table_advisory))
+		return false;
 	return pf_table_name_ok(cfg->table);
 }
 
@@ -405,6 +425,8 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 	struct feed_msg msg;
 	enum feed_outcome o;
 	const char *table;
+	/* The advisory table, or NULL when the class is disabled. */
+	const char *adv;
 	char err[512];
 
 	fp = fopen(path, "r");
@@ -469,6 +491,7 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 	}
 
 	table = cfg->table;
+	adv = (cfg->table_advisory[0] != '\0') ? cfg->table_advisory : NULL;
 
 	if (msg.type == FEED_MSG_LIST) {
 		/*
@@ -486,6 +509,25 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 			st->retained++;
 			return;
 		}
+		/*
+		 * The advisory table is replaced by a snapshot as well. It has no
+		 * delta stream of its own -- every message carries the whole current
+		 * class -- so without this, an entry the controller has since
+		 * promoted to enforced, or dropped from the feed, would sit in the
+		 * advisory table for the life of the process and the class would
+		 * stop describing anything. That is exactly the staleness the
+		 * enforced table's flush exists to prevent.
+		 *
+		 * A failure here is logged and the table left as it was: the class
+		 * is advisory by definition, and failing the whole message over it
+		 * would discard the enforced updates that are the point.
+		 */
+		if (adv != NULL &&
+		    pf_apply_flush(ap, adv, err, sizeof(err)) != PF_APPLY_OK)
+			syslog(LOG_WARNING,
+			       "cannot flush %s for a snapshot: %s -- advisory "
+			       "class left as it was",
+			       adv, err);
 	}
 
 	if (msg.n_add > 0 &&
@@ -497,6 +539,22 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 		return;
 	}
 
+	if (msg.n_advisory > 0 && adv != NULL) {
+		/*
+		 * Written last, and a failure is a warning rather than an error:
+		 * the enforced set above is the one whose loss is a security
+		 * regression, and it is already in place and verified. Nothing is
+		 * blocked on this table unless an operator has written a rule
+		 * against it.
+		 */
+		if (!pf_apply_and_verify(ap, adv, msg.advisory, msg.n_advisory, err,
+		                         sizeof(err)))
+			syslog(LOG_WARNING,
+			       "feed serial %llu: advisory class not applied to "
+			       "%s: %s",
+			       (unsigned long long)msg.serial, adv, err);
+	}
+
 	if (msg.n_remove > 0) {
 		enum pf_apply_result r = pf_apply_del(ap, table, msg.remove,
 		                                      msg.n_remove, err, sizeof(err));
@@ -506,8 +564,10 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 			       (unsigned long long)msg.serial, err);
 	}
 
-	syslog(LOG_INFO, "feed serial %llu applied and verified (+%zu -%zu)",
-	       (unsigned long long)msg.serial, msg.n_add, msg.n_remove);
+	syslog(LOG_INFO,
+	       "feed serial %llu applied and verified (+%zu -%zu, advisory %zu)",
+	       (unsigned long long)msg.serial, msg.n_add, msg.n_remove,
+	       msg.n_advisory);
 	unlink(path);
 	st->applied++;
 }

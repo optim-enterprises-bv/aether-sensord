@@ -97,6 +97,16 @@ struct feed_msg {
 	size_t n_add;
 	FEED_ELEM_TYPE remove[FEED_MAX_ELEMS];
 	size_t n_remove;
+	/*
+	 * The advisory class: prefixes a vetted feed named and no sensor of ours
+	 * has corroborated. Carried in its own array, never merged into `add`,
+	 * because the two mean different things and only one of them may be
+	 * enforced. A device that applied these as `add` would block traffic on an
+	 * external feed's opinion alone -- the exact inverse of what the class
+	 * means, and invisible from both ends.
+	 */
+	FEED_ELEM_TYPE advisory[FEED_MAX_ELEMS];
+	size_t n_advisory;
 	/* Elements the payload offered that we refused, and why they were
 	 * refused. Reported so a feed shipping junk is visible rather than
 	 * presenting as a small update. */
@@ -110,6 +120,14 @@ struct feed_msg {
  * Accepts the JSON shape aether-nemesis emits:
  *   {"type":"delta","serial":7,"add":["1.2.0.0/16"],"remove":[]}
  *   {"type":"list","serial":7,"entries":["1.2.0.0/16"],"attribution":[...]}
+ *   {"type":"delta","serial":7,"add":[],"remove":[],"advisory":["9.9.9.0/24"]}
+ *
+ * `advisory` is an ADDITIONAL key, never a new `type`. The type is validated
+ * first and an unrecognised one makes the whole message unusable, so a new type
+ * would be discarded by every device that has not been reflashed -- silently,
+ * while the controller counted the delivery as successful. An unknown key is
+ * ignored by the same scanner, which is what makes this class safe to send to a
+ * device that predates it.
  *
  * Returns false only when the message is unusable as a whole (no type, no
  * serial). Individual bad elements are refused and counted, because one

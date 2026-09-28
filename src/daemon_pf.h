@@ -78,6 +78,14 @@ struct dpf_config {
 	/* The pf table the reputation set lives in. Must be registered as an
 	 * OPNsense static alias, or nothing will be enforced. */
 	char table[PF_TABLE_NAME_MAX];
+	/*
+	 * The advisory class's table: what a vetted feed named and no sensor of
+	 * ours has corroborated. It is populated and never referenced by a rule, so
+	 * nothing is blocked on it until an operator writes one. Separate from
+	 * `table` because the two carry different confidence and only one may be
+	 * enforced; empty disables the class, matching `table_v6`.
+	 */
+	char table_advisory[PF_TABLE_NAME_MAX];
 	/* IPv6 table. Empty disables v6 handling rather than guessing a name. */
 	char table_v6[PF_TABLE_NAME_MAX];
 	/* Poll interval for the spool, seconds. */

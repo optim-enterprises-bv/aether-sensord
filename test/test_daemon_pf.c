@@ -67,6 +67,69 @@ static void test_defaults_are_safe(void)
 	CHECK(dpf_config_can_enforce(&c), "the defaults can enforce");
 }
 
+
+/*
+ * The advisory table.
+ *
+ * It is populated from the feed and referenced by no rule, so nothing is blocked
+ * on an external feed's uncorroborated opinion. Two failures here would be
+ * silent: a config that ignored `table_advisory` would leave the class in the
+ * default table (where it WOULD be enforced), and one that accepted an invalid
+ * name would leave the class looking empty.
+ */
+static void test_the_advisory_table_defaults_off_the_enforced_one(void)
+{
+	struct dpf_config c;
+	dpf_config_defaults(&c);
+	CHECK(strcmp(c.table_advisory, PF_TABLE_NAME_ADVISORY_DEFAULT) == 0,
+	      "the advisory class has its own default table");
+	CHECK(strcmp(c.table, PF_TABLE_NAME_ADVISORY_DEFAULT) != 0,
+	      "and it is NOT the enforced table -- sharing one would enforce the "
+	      "class, which is the whole thing the split exists to prevent");
+	CHECK(dpf_config_can_enforce(&c),
+	      "a device with the advisory class configured still enforces");
+}
+
+static void test_table_advisory_is_configurable(void)
+{
+	struct dpf_config c;
+	dpf_config_defaults(&c);
+	static const char *text = "table = aisense_rep4\n"
+	                         "table_advisory = aisense_feed4\n";
+	unsigned line = 0;
+	CHECK(dpf_config_parse(&c, text, strlen(text), &line) == DPF_CFG_OK,
+	      "table_advisory is a known key");
+	CHECK(strcmp(c.table_advisory, "aisense_feed4") == 0, "and it is applied");
+}
+
+static void test_an_empty_table_advisory_disables_the_class(void)
+{
+	struct dpf_config c;
+	dpf_config_defaults(&c);
+	static const char *text = "table_advisory = \n";
+	unsigned line = 0;
+	CHECK(dpf_config_parse(&c, text, strlen(text), &line) == DPF_CFG_OK,
+	      "an empty value is accepted");
+	CHECK(c.table_advisory[0] == '\0',
+	      "and disables the class rather than silently keeping the default -- "
+	      "an operator who turned it off must not still be feeding a table");
+	CHECK(dpf_config_can_enforce(&c),
+	      "disabling the advisory class does not disable enforcement");
+}
+
+static void test_an_invalid_advisory_table_name_is_refused(void)
+{
+	struct dpf_config c;
+	dpf_config_defaults(&c);
+	static const char *text = "table_advisory = 9bad name\n";
+	unsigned line = 0;
+	CHECK(dpf_config_parse(&c, text, strlen(text), &line) == DPF_CFG_OK,
+	      "the value parses as text");
+	CHECK(!dpf_config_can_enforce(&c),
+	      "but a name pf would reject stops the daemon rather than leaving "
+	      "the class looking empty");
+}
+
 static void test_config_parses_the_documented_keys(void)
 {
 	struct dpf_config c;
@@ -841,6 +904,10 @@ static void test_a_local_batch_is_confirmed_or_failed(void)
 int main(void)
 {
 	test_defaults_are_safe();
+	test_the_advisory_table_defaults_off_the_enforced_one();
+	test_table_advisory_is_configurable();
+	test_an_empty_table_advisory_disables_the_class();
+	test_an_invalid_advisory_table_name_is_refused();
 	test_config_parses_the_documented_keys();
 	test_a_typo_is_reported_not_ignored();
 	test_unusable_values_are_refused();

@@ -73,6 +73,19 @@
 /* OPNsense's own static aliases use this table name in the generated ruleset. */
 #define PF_TABLE_NAME_DEFAULT "aisense_rep4"
 
+/*
+ * The advisory class's own table, populated from the feed's `advisory` array.
+ *
+ * It exists SEPARATELY and is NOT referenced by any rule, so nothing is blocked
+ * on an external feed's uncorroborated opinion. An operator who wants to act on
+ * the class does it deliberately, by writing a rule against this table -- which
+ * is a decision with a name attached, not a side effect of subscribing to a
+ * feed. The count is reported so the operator can see there is something there.
+ *
+ * Empty disables the class entirely, matching how `table_v6` disables v6.
+ */
+#define PF_TABLE_NAME_ADVISORY_DEFAULT "aisense_feed4"
+
 struct pf_elem {
 	uint8_t addr[16];
 	uint8_t family; /* 4 or 6 */

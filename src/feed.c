@@ -162,6 +162,25 @@ bool feed_parse(const char *json, size_t len, struct feed_msg *out)
 			              &out->rejected, &out->overflowed);
 	}
 
+	/*
+	 * The advisory class rides BOTH message types, so it is read after the
+	 * type-specific branch rather than inside either one. A device that does
+	 * not know the key simply never matches it -- find_key requires the closing
+	 * quote, so "advisory" is not satisfied by "add" -- which is what makes it
+	 * safe for the controller to send this ahead of the fleet.
+	 *
+	 * The count is separate from `n_add` on purpose: these elements are for a
+	 * table nothing enforces against, and merging them into `add` would put an
+	 * external feed's uncorroborated opinion into the same set as our own
+	 * measured evidence.
+	 */
+	{
+		const char *vp = find_key(json, end, "advisory");
+		if (vp)
+			collect_array(vp, end, out->advisory, FEED_MAX_ELEMS,
+			              &out->n_advisory, &out->rejected, &out->overflowed);
+	}
+
 	return true;
 }
 

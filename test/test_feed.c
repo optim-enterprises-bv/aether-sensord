@@ -268,6 +268,59 @@ static void test_unknown_keys_are_ignored_and_advisory_is_not_add(void)
 	CHECK(m.type == FEED_MSG_LIST, "and the known parts still parse");
 }
 
+
+/*
+ * The advisory class: the counts the apply path depends on.
+ *
+ * The isolation between `add` and `advisory` is covered by
+ * test_unknown_keys_are_ignored_and_advisory_is_not_add. What follows is the
+ * rest of the contract the daemon reads: how many elements each class carries
+ * on each message type, and that a malformed element is counted rather than
+ * silently dropped -- a class that quietly loses entries reads as a class that
+ * is empty, and "nothing named" and "everything refused" are not the same
+ * statement about the feed.
+ */
+static void test_advisory_counts_on_both_message_types(void)
+{
+	struct feed_msg m;
+	CHECK(parse("{\"type\":\"delta\",\"serial\":20,"
+	            "\"add\":[\"203.0.113.0/24\"],\"remove\":[],"
+	            "\"advisory\":[\"198.51.100.0/24\",\"192.0.2.0/24\"]}", &m),
+	      "an advisory delta parses");
+	CHECK(m.n_add == 1, "one enforced entry");
+	CHECK(m.n_advisory == 2, "two advisory entries");
+
+	/* A snapshot carries the class too, and it is the whole class rather than
+	 * a delta -- the daemon flushes the advisory table on a snapshot for
+	 * exactly that reason. */
+	struct feed_msg l;
+	CHECK(parse("{\"type\":\"list\",\"serial\":21,"
+	            "\"entries\":[\"203.0.113.0/24\"],"
+	            "\"advisory\":[\"198.51.100.0/24\"]}", &l),
+	      "an advisory snapshot parses");
+	CHECK(l.n_add == 1 && l.n_advisory == 1, "one of each");
+}
+
+static void test_an_absent_advisory_class_is_zero_not_garbage(void)
+{
+	struct feed_msg m;
+	CHECK(parse("{\"type\":\"delta\",\"serial\":22,\"add\":[],\"remove\":[]}", &m),
+	      "a message without the key parses");
+	CHECK(m.n_advisory == 0,
+	      "an absent class is zero -- reading an uninitialised count here "
+	      "would hand the apply path elements nobody sent");
+}
+
+static void test_a_bad_advisory_element_is_counted_not_applied(void)
+{
+	struct feed_msg m;
+	CHECK(parse("{\"type\":\"delta\",\"serial\":23,\"add\":[],\"remove\":[],"
+	            "\"advisory\":[\"not-an-address\",\"198.51.100.0/24\"]}", &m),
+	      "the message parses");
+	CHECK(m.n_advisory == 1, "only the valid element is collected");
+	CHECK(m.rejected == 1, "the malformed one is counted, not silently dropped");
+}
+
 int main(void)
 {
 	test_parse_delta();
@@ -283,6 +336,9 @@ int main(void)
 	test_snapshot_recovers_from_a_long_outage();
 	test_overflow_is_counted();
 	test_unknown_keys_are_ignored_and_advisory_is_not_add();
+	test_advisory_counts_on_both_message_types();
+	test_an_absent_advisory_class_is_zero_not_garbage();
+	test_a_bad_advisory_element_is_counted_not_applied();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
