@@ -223,6 +223,51 @@ static void test_overflow_is_counted(void)
 	CHECK(m.overflowed == 20, "overflow refused AND counted");
 }
 
+/*
+ * A newer controller may add keys this build does not know. It must keep
+ * working: the alternative is that every device that has not been reflashed
+ * discards the message, and the controller reports successful delivery while
+ * nothing is applied.
+ *
+ * `advisory` is the first such key and the one worth an explicit case, because
+ * it is a prefix of `add`. find_key matches `"add"` including the closing quote,
+ * so `"advisory"` cannot be mistaken for it -- but if that ever changed, the
+ * advisory list would be applied as ENFORCED addresses, which is the exact
+ * inverse of what the class means. This test is what makes that visible.
+ */
+static void test_unknown_keys_are_ignored_and_advisory_is_not_add(void)
+{
+	struct feed_msg m;
+
+	/* A delta carrying an advisory class: the enforced set is `add` alone. */
+	CHECK(parse("{\"type\":\"delta\",\"serial\":9,"
+	            "\"add\":[\"1.10.16.0/20\"],\"remove\":[],"
+	            "\"advisory\":[\"45.155.205.233/32\"]}", &m),
+	      "a message with an unknown key still parses");
+	CHECK(m.n_add == 1, "one enforced addition");
+	CHECK(m.n_remove == 0, "no removals");
+	/* The element is a binary address, not the string: compare the parsed
+	 * form, so this checks what the kernel would be handed. */
+	CHECK(m.add[0].family == 4 && m.add[0].prefix == 20 &&
+	          m.add[0].addr[0] == 1 && m.add[0].addr[1] == 10 &&
+	          m.add[0].addr[2] == 16 && m.add[0].addr[3] == 0,
+	      "the enforced element is the one under `add`, not the advisory one");
+
+	/* The prefix hazard, stated directly: an advisory list must not be read as
+	 * an addition list, in either key order. */
+	CHECK(parse("{\"type\":\"delta\",\"serial\":10,\"advisory\":[],"
+	            "\"add\":[],\"remove\":[]}", &m),
+	      "an empty advisory array is harmless");
+	CHECK(m.n_add == 0, "an empty advisory is not an empty `add` either way");
+
+	/* And a message made only of keys this build has never seen must still be
+	 * usable rather than discarded. */
+	CHECK(parse("{\"type\":\"list\",\"serial\":11,\"entries\":[],"
+	            "\"something_new\":[1,2,3],\"another\":{\"a\":1}}", &m),
+	      "unknown top-level keys do not make a message unusable");
+	CHECK(m.type == FEED_MSG_LIST, "and the known parts still parse");
+}
+
 int main(void)
 {
 	test_parse_delta();
@@ -237,6 +282,7 @@ int main(void)
 	test_replayed_delta_is_stale();
 	test_snapshot_recovers_from_a_long_outage();
 	test_overflow_is_counted();
+	test_unknown_keys_are_ignored_and_advisory_is_not_add();
 
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
