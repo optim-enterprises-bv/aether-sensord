@@ -107,6 +107,28 @@ struct feed_msg {
 	 */
 	FEED_ELEM_TYPE advisory[FEED_MAX_ELEMS];
 	size_t n_advisory;
+	/*
+	 * The local class: addresses an OPERATOR decided to block, as opposed to
+	 * anything a feed or a signature named. Distinct from `add` for the same
+	 * reason `advisory` is -- it is a different kind of claim -- and distinct
+	 * from `advisory` because it is meant to be ENFORCED. On FreeBSD pf this
+	 * is the only way a per-client block can exist at all: pf accepts no MAC
+	 * in a table or a rule (verified on the appliance: "no IP address found
+	 * for 02:00:5e:10:00:00"), so a blocked device must be expressed as the
+	 * address that device currently holds.
+	 */
+	FEED_ELEM_TYPE local[FEED_MAX_ELEMS];
+	size_t n_local;
+	/*
+	 * Removals from the local class, as their own array.
+	 *
+	 * `remove` belongs to the enforced reputation set and is applied to that
+	 * table; folding an operator's un-block into it would delete the address
+	 * from the WRONG table -- silently unblocking a host the fleet's own
+	 * sensors scored, which is the failure direction that matters.
+	 */
+	FEED_ELEM_TYPE local_remove[FEED_MAX_ELEMS];
+	size_t n_local_remove;
 	/* Elements the payload offered that we refused, and why they were
 	 * refused. Reported so a feed shipping junk is visible rather than
 	 * presenting as a small update. */

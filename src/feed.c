@@ -163,6 +163,28 @@ bool feed_parse(const char *json, size_t len, struct feed_msg *out)
 	}
 
 	/*
+	 * The local class rides BOTH message types for the same reason advisory
+	 * does: it is a set an operator owns, not a delta the controller
+	 * computes, so a snapshot carries the whole class and a delta carries
+	 * the change.
+	 *
+	 * Read AFTER the type-specific branch so a `local` key is found whatever
+	 * the type. `local_remove` is a separate key and cannot be mistaken for
+	 * this one -- find_key requires the closing quote at p[1+klen].
+	 */
+	{
+		const char *lp = find_key(json, end, "local");
+		if (lp)
+			collect_array(lp, end, out->local, FEED_MAX_ELEMS,
+			              &out->n_local, &out->rejected, &out->overflowed);
+		const char *lr = find_key(json, end, "local_remove");
+		if (lr)
+			collect_array(lr, end, out->local_remove, FEED_MAX_ELEMS,
+			              &out->n_local_remove, &out->rejected,
+			              &out->overflowed);
+	}
+
+	/*
 	 * The advisory class rides BOTH message types, so it is read after the
 	 * type-specific branch rather than inside either one. A device that does
 	 * not know the key simply never matches it -- find_key requires the closing

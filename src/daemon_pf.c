@@ -564,10 +564,69 @@ static void process_file(struct dpf_config *cfg, struct pf_apply_ctx *ap,
 			       (unsigned long long)msg.serial, err);
 	}
 
+	/*
+	 * The local class: operator-decided blocks, ENFORCED.
+	 *
+	 * This is the only per-client block a FreeBSD firewall can express. pf
+	 * refuses a MAC in a table or in a rule -- verified on the appliance,
+	 * `pfctl -t t -T add 02:00:5e:10:00:00` returns "no IP address found
+	 * for", and a rule with the same source fails to parse -- so a blocked
+	 * device is enforced as the address it currently holds. The controller
+	 * is what knows the address, because only the firewall sees the DHCP
+	 * lease; this daemon never guesses one from the MAC.
+	 *
+	 * NEVER FLUSHED. Unlike `table`, this table has no snapshot semantics
+	 * here, because it is the same table the capture path writes
+	 * (`dpf_run_local` -> `locef_apply`) and that path is add-only. A flush
+	 * would silently drop measured blocks that this message knows nothing
+	 * about. Removals are explicit instead, which is why `local_remove`
+	 * exists as its own key.
+	 */
+	if (cfg->table_local[0] != '\0') {
+		if (msg.n_local > 0 &&
+		    !pf_apply_and_verify(ap, cfg->table_local, msg.local,
+		                         msg.n_local, err, sizeof(err))) {
+			/*
+			 * A failure here is a WARNING, not an error: `table_local`
+			 * may be referenced by no rule (it is today), in which
+			 * case pf_apply_and_verify correctly reports the elements
+			 * as unconfirmed. That is a statement about enforcement,
+			 * not about whether the operator's decision was recorded.
+			 */
+			syslog(LOG_WARNING,
+			       "feed serial %llu: local class not applied to %s: %s",
+			       (unsigned long long)msg.serial, cfg->table_local,
+			       err);
+		}
+		if (msg.n_local_remove > 0) {
+			enum pf_apply_result r =
+			    pf_apply_del(ap, cfg->table_local, msg.local_remove,
+			                 msg.n_local_remove, err, sizeof(err));
+			if (r != PF_APPLY_OK)
+				syslog(LOG_WARNING,
+				       "feed serial %llu: local removals not "
+				       "applied to %s: %s",
+				       (unsigned long long)msg.serial,
+				       cfg->table_local, err);
+		}
+	} else if (msg.n_local > 0 || msg.n_local_remove > 0) {
+		/*
+		 * The operator has decided to block someone and this box has no
+		 * table configured to put it in. That is a misconfiguration, not
+		 * an empty set -- saying nothing would make a block that never
+		 * lands look exactly like a block that is working.
+		 */
+		syslog(LOG_WARNING,
+		       "feed serial %llu carries %zu local block(s) but "
+		       "table_local is unset -- NOT applied",
+		       (unsigned long long)msg.serial, msg.n_local);
+	}
+
 	syslog(LOG_INFO,
-	       "feed serial %llu applied and verified (+%zu -%zu, advisory %zu)",
+	       "feed serial %llu applied and verified (+%zu -%zu, advisory %zu, "
+	       "local %zu)",
 	       (unsigned long long)msg.serial, msg.n_add, msg.n_remove,
-	       msg.n_advisory);
+	       msg.n_advisory, msg.n_local);
 	unlink(path);
 	st->applied++;
 }

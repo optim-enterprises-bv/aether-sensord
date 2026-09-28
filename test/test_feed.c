@@ -321,6 +321,125 @@ static void test_a_bad_advisory_element_is_counted_not_applied(void)
 	CHECK(m.rejected == 1, "the malformed one is counted, not silently dropped");
 }
 
+
+/*
+ * The local class: an operator's own block decision.
+ *
+ * Three properties are load-bearing and each is a way this can go wrong
+ * silently:
+ *
+ *   1. It must not land in `add`. That is the enforced reputation set, and an
+ *      operator block is not a fleet observation; merging them would make one
+ *      address that an operator chose indistinguishable from one our sensors
+ *      scored.
+ *   2. It must not land in `advisory`. Advisory is precisely the class nothing
+ *      enforces, and a block an operator asked for is meant to be enforced --
+ *      putting it in the advisory table would record the decision and never
+ *      apply it.
+ *   3. `local_remove` must not land in `remove`. `remove` deletes from the
+ *      reputation table, so a mis-parse there would unblock an address the
+ *      fleet scored hostile while the operator's own un-block was applied to
+ *      the wrong table.
+ */
+static void test_local_class_is_its_own(void)
+{
+	struct feed_msg m;
+	static const char *json =
+	    "{\"type\":\"delta\",\"serial\":7,"
+	    "\"add\":[\"203.0.113.9\"],"
+	    "\"local\":[\"192.168.20.84\"],"
+	    "\"local_remove\":[\"192.168.20.99\"]}";
+
+	CHECK(parse(json, &m), "the message parses");
+	CHECK(m.n_add == 1, "one enforced element");
+	CHECK(m.n_local == 1, "one local element");
+	CHECK(m.n_local_remove == 1, "one local removal");
+	CHECK(m.n_advisory == 0, "local is not the advisory class");
+	CHECK(m.n_remove == 0, "local_remove is not the reputation removal set");
+
+	/* And the addresses themselves went to the right arrays, not merely the
+	 * right counts -- a swap between two arrays of the same length would
+	 * pass every check above. */
+	CHECK(m.local[0].family == 4 && m.local[0].addr[0] == 192 &&
+	          m.local[0].addr[1] == 168 && m.local[0].addr[2] == 20 &&
+	          m.local[0].addr[3] == 84,
+	      "the local element is the local address");
+	CHECK(m.add[0].addr[0] == 203 && m.add[0].addr[3] == 9,
+	      "the enforced element is the enforced address");
+	CHECK(m.local_remove[0].addr[2] == 20 && m.local_remove[0].addr[3] == 99,
+	      "the local removal is the local_remove address");
+}
+
+/*
+ * A device that does not know the key must be unaffected by it.
+ *
+ * This is what makes the class safe to send before the fleet is reflashed: the
+ * controller ships one message shape to every device, and an older daemon must
+ * apply the reputation update exactly as it would have and ignore the rest.
+ */
+static void test_local_class_is_forward_compatible(void)
+{
+	struct feed_msg m;
+	static const char *json =
+	    "{\"type\":\"delta\",\"serial\":8,"
+	    "\"add\":[\"198.51.100.4\"],"
+	    "\"local\":[\"10.0.0.5\"],"
+	    "\"unknown_future_key\":[\"10.0.0.6\"],"
+	    "\"advisory\":[\"203.0.113.77\"]}";
+
+	CHECK(parse(json, &m), "the message parses");
+	CHECK(m.n_add == 1, "the enforced update is unaffected");
+	CHECK(m.add[0].addr[0] == 198 && m.add[0].addr[3] == 4,
+	      "and it is the right address");
+	CHECK(m.n_local == 1, "the local class is read");
+	CHECK(m.n_advisory == 1, "the advisory class is read");
+	CHECK(m.n_local_remove == 0, "an absent local_remove is zero, not garbage");
+}
+
+/*
+ * A snapshot carries the whole local class.
+ *
+ * `list` is the type the controller sends after a gap, and it is authoritative.
+ * The local class must survive it -- a snapshot that silently dropped an
+ * operator's blocks would unblock them on the next reconnect, and the operator
+ * would never be told.
+ */
+static void test_local_class_rides_a_snapshot(void)
+{
+	struct feed_msg m;
+	static const char *json =
+	    "{\"type\":\"list\",\"serial\":9,"
+	    "\"entries\":[\"203.0.113.10\"],"
+	    "\"local\":[\"192.168.20.84\",\"192.168.20.85\"]}";
+
+	CHECK(parse(json, &m), "the snapshot parses");
+	CHECK(m.type == FEED_MSG_LIST, "it is a snapshot");
+	/* n_add counts `entries` alone: the local class is deliberately NOT
+	 * folded in, so a snapshot cannot inflate the enforced set with
+	 * operator decisions. */
+	CHECK(m.n_add == 1, "the entries are the enforced set, local excluded");
+	CHECK(m.n_local == 2, "and the local class is carried whole");
+}
+
+/*
+ * `local_remove` is not `local`, and a prefix-pair key must not alias.
+ *
+ * find_key matches the closing quote, so "local" is not satisfied by
+ * "local_remove". If that ever changed, every local removal would also be
+ * ADDED as a block -- an operator unblocking a device would block it harder.
+ */
+static void test_local_remove_does_not_alias_local(void)
+{
+	struct feed_msg m;
+	static const char *json =
+	    "{\"type\":\"delta\",\"serial\":10,"
+	    "\"local_remove\":[\"192.168.20.99\"]}";
+
+	CHECK(parse(json, &m), "the message parses");
+	CHECK(m.n_local == 0, "a local_remove alone adds nothing to local");
+	CHECK(m.n_local_remove == 1, "and is counted as a removal");
+}
+
 int main(void)
 {
 	test_parse_delta();
@@ -336,6 +455,10 @@ int main(void)
 	test_snapshot_recovers_from_a_long_outage();
 	test_overflow_is_counted();
 	test_unknown_keys_are_ignored_and_advisory_is_not_add();
+	test_local_class_is_its_own();
+	test_local_class_is_forward_compatible();
+	test_local_class_rides_a_snapshot();
+	test_local_remove_does_not_alias_local();
 	test_advisory_counts_on_both_message_types();
 	test_an_absent_advisory_class_is_zero_not_garbage();
 	test_a_bad_advisory_element_is_counted_not_applied();
